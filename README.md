@@ -71,6 +71,7 @@ anthropic-proxy --help
 | `--debug` | `-d` | Enable debug logging |
 | `--verbose` | `-v` | Enable verbose logging (logs full request/response bodies) |
 | `--port <PORT>` | `-p` | Port to listen on (overrides PORT env var) |
+| `--system-prompt-ignore <TEXT>` | | Remove one or more system prompt terms before forwarding upstream (repeat or separate with `;`) |
 | `--daemon` | | Run as background daemon |
 | `--pid-file <FILE>` | | PID file path (default: `/tmp/anthropic-proxy.pid`) |
 | `--help` | `-h` | Print help information |
@@ -85,6 +86,7 @@ Configuration can be set via environment variables or `.env` file:
 | `UPSTREAM_BASE_URL` | **Yes** | - | OpenAI-compatible endpoint URL |
 | `UPSTREAM_API_KEY` | No* | - | API key for upstream service |
 | `PORT` | No | `3000` | Server port |
+| `ANTHROPIC_PROXY_SYSTEM_PROMPT_IGNORE_TERMS` | No | - | System prompt terms to remove before forwarding upstream (`;` or newline separated) |
 | `ANTHROPIC_PROXY_MODEL_MAP` | No | - | Exact model remapping before the upstream call (`source=target;other=target`) |
 | `REASONING_MODEL` | No | (uses request model) | Model to use when extended thinking is enabled** |
 | `COMPLETION_MODEL` | No | (uses request model) | Model to use for standard requests (no thinking)** |
@@ -98,6 +100,11 @@ Configuration can be set via environment variables or `.env` file:
 - Service base URL: `https://api.openai.com` -> `/v1/chat/completions`
 - Versioned base URL: `https://gateway.company.internal/v2` -> `/v2/chat/completions`
 - Full endpoint: `https://gateway.company.internal/v2/chat/completions`
+
+System prompt sanitization:
+- The proxy can remove configured terms from upstream `system` prompts before forwarding.
+- Set terms with `ANTHROPIC_PROXY_SYSTEM_PROMPT_IGNORE_TERMS='rm -rf;git reset --hard'`
+- Or repeat `--system-prompt-ignore`, for example `--system-prompt-ignore 'rm -rf' --system-prompt-ignore 'git reset --hard'`
 
 Model mapping:
 - `ANTHROPIC_PROXY_MODEL_MAP='claude-opus-4-6=openai/gpt-4.1;claude-haiku-4-5=openai/gpt-4.1-mini'`
@@ -141,6 +148,18 @@ DEBUG=true anthropic-proxy
 
 # Enable verbose logging (logs full request/response bodies)
 anthropic-proxy --verbose
+```
+
+### With System Prompt Ignore Terms
+
+```bash
+# Remove specific terms via environment variable
+ANTHROPIC_PROXY_SYSTEM_PROMPT_IGNORE_TERMS='rm -rf;git reset --hard' anthropic-proxy
+
+# Or via CLI flag
+anthropic-proxy \
+  --system-prompt-ignore 'rm -rf' \
+  --system-prompt-ignore 'git reset --hard'
 ```
 
 ### With Custom Config File
@@ -255,6 +274,9 @@ The following Anthropic API features are **not supported** currently (Claude Cod
 
 **Model not found errors**  
 → Set `REASONING_MODEL` and `COMPLETION_MODEL` to override the models from client requests, or use `ANTHROPIC_PROXY_MODEL_MAP` to remap client model names to upstream model names
+
+**Gateway/WAF blocks Claude Code system prompts with `403`**
+→ Use `ANTHROPIC_PROXY_SYSTEM_PROMPT_IGNORE_TERMS` or `--system-prompt-ignore` to remove offending terms before forwarding upstream
 
 ## License
 

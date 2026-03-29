@@ -8,6 +8,7 @@ pub struct Config {
     pub base_url: String,
     pub api_key: Option<String>,
     pub model_map: BTreeMap<String, String>,
+    pub system_prompt_ignore_terms: Vec<String>,
     pub reasoning_model: Option<String>,
     pub completion_model: Option<String>,
     pub debug: bool,
@@ -93,6 +94,12 @@ impl Config {
             .transpose()?
             .unwrap_or_default();
 
+        let mut system_prompt_ignore_terms = env::var("ANTHROPIC_PROXY_SYSTEM_PROMPT_IGNORE_TERMS")
+            .ok()
+            .map(|value| Self::parse_system_prompt_ignore_terms(&value))
+            .unwrap_or_default();
+        Self::dedupe_ignore_terms(&mut system_prompt_ignore_terms);
+
         let reasoning_model = env::var("REASONING_MODEL").ok();
         let completion_model = env::var("COMPLETION_MODEL").ok();
 
@@ -109,6 +116,7 @@ impl Config {
             base_url,
             api_key,
             model_map,
+            system_prompt_ignore_terms,
             reasoning_model,
             completion_model,
             debug,
@@ -218,6 +226,32 @@ impl Config {
 
         version
             .is_some_and(|value| !value.is_empty() && value.chars().all(|ch| ch.is_ascii_digit()))
+    }
+
+    pub fn parse_system_prompt_ignore_terms(value: &str) -> Vec<String> {
+        value
+            .split(|ch| ch == ';' || ch == '\n')
+            .map(str::trim)
+            .filter(|term| !term.is_empty())
+            .map(ToOwned::to_owned)
+            .collect()
+    }
+
+    pub fn dedupe_ignore_terms(terms: &mut Vec<String>) {
+        let mut deduped = Vec::new();
+        let mut seen = Vec::new();
+        for term in terms.drain(..) {
+            let normalized = term
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_ascii_lowercase();
+            if !seen.iter().any(|existing: &String| existing == &normalized) {
+                seen.push(normalized);
+                deduped.push(term);
+            }
+        }
+        *terms = deduped;
     }
 
     pub fn parse_model_map(value: &str) -> Result<BTreeMap<String, String>> {
@@ -379,6 +413,37 @@ mod tests {
     fn uppercase_version_prefix_is_accepted() {
         let url = Config::resolve_chat_completions_url("https://gateway.example.com/V2").unwrap();
         assert_eq!(url, "https://gateway.example.com/V2/chat/completions");
+    }
+
+    #[test]
+    fn parse_system_prompt_ignore_terms_supports_semicolons_and_newlines() {
+        let terms =
+            Config::parse_system_prompt_ignore_terms("rm -rf;git reset --hard\nsudo rm -rf");
+
+        assert_eq!(
+            terms,
+            vec![
+                "rm -rf".to_string(),
+                "git reset --hard".to_string(),
+                "sudo rm -rf".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn dedupe_ignore_terms_normalizes_case_and_whitespace() {
+        let mut terms = vec![
+            "rm -rf".to_string(),
+            " RM\t-rF ".to_string(),
+            "git reset --hard".to_string(),
+        ];
+
+        Config::dedupe_ignore_terms(&mut terms);
+
+        assert_eq!(
+            terms,
+            vec!["rm -rf".to_string(), "git reset --hard".to_string()]
+        );
     }
 
     #[test]
