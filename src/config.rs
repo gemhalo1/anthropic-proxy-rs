@@ -1,12 +1,13 @@
 use anyhow::{bail, Result};
 use reqwest::Url;
-use std::{env, path::PathBuf};
+use std::{collections::BTreeMap, env, path::PathBuf};
 
 #[derive(Debug, Clone)]
 pub struct Config {
     pub port: u16,
     pub base_url: String,
     pub api_key: Option<String>,
+    pub model_map: BTreeMap<String, String>,
     pub reasoning_model: Option<String>,
     pub completion_model: Option<String>,
     pub debug: bool,
@@ -86,6 +87,12 @@ impl Config {
             .ok()
             .filter(|k| !k.is_empty());
 
+        let model_map = env::var("ANTHROPIC_PROXY_MODEL_MAP")
+            .ok()
+            .map(|value| Self::parse_model_map(&value))
+            .transpose()?
+            .unwrap_or_default();
+
         let reasoning_model = env::var("REASONING_MODEL").ok();
         let completion_model = env::var("COMPLETION_MODEL").ok();
 
@@ -101,6 +108,7 @@ impl Config {
             port,
             base_url,
             api_key,
+            model_map,
             reasoning_model,
             completion_model,
             debug,
@@ -211,6 +219,37 @@ impl Config {
         version
             .is_some_and(|value| !value.is_empty() && value.chars().all(|ch| ch.is_ascii_digit()))
     }
+
+    pub fn parse_model_map(value: &str) -> Result<BTreeMap<String, String>> {
+        let mut model_map = BTreeMap::new();
+
+        for entry in value
+            .split(|ch| ch == ';' || ch == '\n')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+        {
+            let (source, target) = entry.split_once('=').ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Invalid ANTHROPIC_PROXY_MODEL_MAP entry '{}'. Expected source=target",
+                    entry
+                )
+            })?;
+
+            let source = source.trim();
+            let target = target.trim();
+
+            if source.is_empty() || target.is_empty() {
+                bail!(
+                    "Invalid ANTHROPIC_PROXY_MODEL_MAP entry '{}'. Source and target models must be non-empty",
+                    entry
+                );
+            }
+
+            model_map.insert(source.to_string(), target.to_string());
+        }
+
+        Ok(model_map)
+    }
 }
 
 #[cfg(test)]
@@ -298,8 +337,7 @@ mod tests {
 
     #[test]
     fn explicit_v1_is_preserved_not_doubled() {
-        let url =
-            Config::resolve_chat_completions_url("https://openrouter.ai/api/v1").unwrap();
+        let url = Config::resolve_chat_completions_url("https://openrouter.ai/api/v1").unwrap();
         assert_eq!(url, "https://openrouter.ai/api/v1/chat/completions");
     }
 
@@ -323,8 +361,7 @@ mod tests {
 
     #[test]
     fn url_with_subpath_and_no_version_defaults_to_v1() {
-        let url =
-            Config::resolve_chat_completions_url("https://openrouter.ai/api").unwrap();
+        let url = Config::resolve_chat_completions_url("https://openrouter.ai/api").unwrap();
         assert_eq!(url, "https://openrouter.ai/api/v1/chat/completions");
     }
 
@@ -340,8 +377,31 @@ mod tests {
 
     #[test]
     fn uppercase_version_prefix_is_accepted() {
-        let url =
-            Config::resolve_chat_completions_url("https://gateway.example.com/V2").unwrap();
+        let url = Config::resolve_chat_completions_url("https://gateway.example.com/V2").unwrap();
         assert_eq!(url, "https://gateway.example.com/V2/chat/completions");
+    }
+
+    #[test]
+    fn parse_model_map_supports_semicolons_and_newlines() {
+        let model_map = Config::parse_model_map(
+            "claude-3-5-sonnet=openai/gpt-5.2-chat\nclaude-haiku=openai/gpt-4.1-mini",
+        )
+        .unwrap();
+
+        assert_eq!(
+            model_map.get("claude-3-5-sonnet"),
+            Some(&"openai/gpt-5.2-chat".to_string())
+        );
+        assert_eq!(
+            model_map.get("claude-haiku"),
+            Some(&"openai/gpt-4.1-mini".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_model_map_rejects_invalid_entries() {
+        let err = Config::parse_model_map("claude-3-5-sonnet").unwrap_err();
+
+        assert!(err.to_string().contains("Expected source=target"));
     }
 }
