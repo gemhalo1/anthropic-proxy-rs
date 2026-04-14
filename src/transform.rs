@@ -26,6 +26,7 @@ pub fn anthropic_to_openai(
             .or_else(|| Some(req.model.clone()))
             .unwrap_or_else(|| req.model.clone())
     };
+    let model = config.model_map.get(&model).cloned().unwrap_or(model);
 
     // Convert messages
     let mut openai_messages = Vec::new();
@@ -321,7 +322,9 @@ pub fn map_stop_reason(finish_reason: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::openai_to_anthropic;
-    use crate::models::openai;
+    use crate::config::Config;
+    use crate::models::{anthropic, openai};
+    use serde_json::json;
 
     #[test]
     fn openai_response_allows_missing_metadata_fields() {
@@ -446,5 +449,46 @@ mod tests {
         assert_eq!(anthropic.last_id.as_deref(), Some("only-model"));
         assert_eq!(anthropic.data.len(), 1);
         assert_eq!(anthropic.data[0].display_name, "only-model");
+    }
+
+    #[test]
+    fn anthropic_to_openai_applies_model_map_after_selection() {
+        let req = anthropic::AnthropicRequest {
+            model: "claude-opus-4-6".to_string(),
+            messages: vec![anthropic::Message {
+                role: "user".to_string(),
+                content: anthropic::MessageContent::Text("pong".to_string()),
+            }],
+            max_tokens: 64,
+            system: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: Some(false),
+            tools: None,
+            metadata: None,
+            extra: json!({}),
+        };
+
+        let config = Config {
+            port: 3000,
+            base_url: "https://example.com".to_string(),
+            api_key: None,
+            model_map: [(
+                "claude-opus-4-6".to_string(),
+                "openai/gpt-4.1".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            reasoning_model: None,
+            completion_model: None,
+            debug: false,
+            verbose: false,
+        };
+
+        let openai = super::anthropic_to_openai(req, &config).unwrap();
+
+        assert_eq!(openai.model, "openai/gpt-4.1");
     }
 }

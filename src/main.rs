@@ -119,6 +119,15 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     } else {
         tracing::info!("API Key: not set (using unauthenticated endpoint)");
     }
+    if !config.model_map.is_empty() {
+        let entries = config
+            .model_map
+            .iter()
+            .map(|(source, target)| format!("{source} -> {target}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        tracing::info!("Model map: {}", entries);
+    }
 
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(300))

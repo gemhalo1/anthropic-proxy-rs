@@ -85,6 +85,7 @@ Configuration can be set via environment variables or `.env` file:
 | `UPSTREAM_BASE_URL` | **Yes** | - | OpenAI-compatible endpoint URL |
 | `UPSTREAM_API_KEY` | No* | - | API key for upstream service |
 | `PORT` | No | `3000` | Server port |
+| `ANTHROPIC_PROXY_MODEL_MAP` | No | - | Exact model remapping before the upstream call (`source=target;other=target`) |
 | `REASONING_MODEL` | No | (uses request model) | Model to use when extended thinking is enabled** |
 | `COMPLETION_MODEL` | No | (uses request model) | Model to use for standard requests (no thinking)** |
 | `DEBUG` | No | `false` | Enable debug logging (`1` or `true`) |
@@ -97,6 +98,10 @@ Configuration can be set via environment variables or `.env` file:
 - Service base URL: `https://api.openai.com` -> `/v1/chat/completions`
 - Versioned base URL: `https://gateway.company.internal/v2` -> `/v2/chat/completions`
 - Full endpoint: `https://gateway.company.internal/v2/chat/completions`
+
+Model mapping:
+- `ANTHROPIC_PROXY_MODEL_MAP='claude-opus-4-6=openai/gpt-4.1;claude-haiku-4-5=openai/gpt-4.1-mini'`
+- `REASONING_MODEL` and `COMPLETION_MODEL` are selected first, then `ANTHROPIC_PROXY_MODEL_MAP` is applied to the final model name before the upstream call
 
 ### Configuration File Locations
 
@@ -188,6 +193,15 @@ anthropic-proxy stop --pid-file ~/.anthropic-proxy.pid
 
 > **Note**: When running as daemon, logs are written to `/tmp/anthropic-proxy.log`
 
+### With Model Mapping
+
+```bash
+UPSTREAM_BASE_URL=https://gateway.company.internal/v2 \
+  UPSTREAM_API_KEY=sk-... \
+  ANTHROPIC_PROXY_MODEL_MAP='claude-opus-4-6=openai/gpt-4.1;claude-haiku-4-5=openai/gpt-4.1-mini' \
+  anthropic-proxy
+```
+
 ## Supported Features
 
 ✅ Text messages  
@@ -240,7 +254,7 @@ The following Anthropic API features are **not supported** currently (Claude Cod
   - Partial paths like `.../chat` and URLs with query strings/fragments are rejected
 
 **Model not found errors**  
-→ Set `REASONING_MODEL` and `COMPLETION_MODEL` to override the models from client requests
+→ Set `REASONING_MODEL` and `COMPLETION_MODEL` to override the models from client requests, or use `ANTHROPIC_PROXY_MODEL_MAP` to remap client model names to upstream model names
 
 ## License
 
