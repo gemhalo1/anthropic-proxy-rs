@@ -420,9 +420,9 @@ fn create_sse_stream(
                                                     "stop_reason": stop_reason,
                                                     "stop_sequence": serde_json::Value::Null
                                                 },
-                                                "usage": chunk.usage.as_ref().map(|u| json!({
-                                                    "output_tokens": u.completion_tokens
-                                                }))
+                                                "usage": {
+                                                    "output_tokens": chunk.usage.as_ref().map(|u| u.completion_tokens).unwrap_or(0)
+                                                }
                                             });
                                             let sse_data = format!("event: message_delta\ndata: {}\n\n",
                                                 serde_json::to_string(&event).unwrap_or_default());
