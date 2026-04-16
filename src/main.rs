@@ -1,6 +1,7 @@
 mod cli;
 mod config;
 mod error;
+mod metrics;
 mod models;
 mod proxy;
 mod translate;
@@ -144,6 +145,8 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         tracing::info!("Model map: {}", entries);
     }
 
+    let metrics_handle = metrics::install();
+
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(300))
         .connect_timeout(std::time::Duration::from_secs(10))
@@ -161,6 +164,13 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         .route("/v1/messages", post(proxy::proxy_handler))
         .route("/v1/models", get(proxy::list_models_handler))
         .route("/health", axum::routing::get(health_handler))
+        .route(
+            "/metrics",
+            get(move || {
+                let handle = metrics_handle.clone();
+                async move { handle.render() }
+            }),
+        )
         .layer(Extension(config.clone()))
         .layer(Extension(client))
         .layer(TraceLayer::new_for_http())

@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::error::{ProxyError, ProxyResult};
+use crate::metrics;
 use crate::models::{anthropic, openai};
 use crate::translate::{pipeline, stream};
 use axum::{
@@ -12,7 +13,7 @@ use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
 use reqwest::Client;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub async fn proxy_handler(
     Extension(config): Extension<Arc<Config>>,
@@ -20,9 +21,11 @@ pub async fn proxy_handler(
     Json(req): Json<anthropic::AnthropicRequest>,
 ) -> ProxyResult<Response> {
     let is_streaming = req.stream.unwrap_or(false);
+    let start = Instant::now();
 
     tracing::debug!("Received request for model: {}", req.model);
     tracing::debug!("Streaming: {}", is_streaming);
+    metrics::request_started(is_streaming);
 
     if config.verbose {
         tracing::trace!(
@@ -41,11 +44,19 @@ pub async fn proxy_handler(
         );
     }
 
-    if is_streaming {
+    let result = if is_streaming {
         handle_streaming(config, client, openai_req).await
     } else {
         handle_non_streaming(config, client, openai_req).await
-    }
+    };
+
+    let status = match &result {
+        Ok(resp) => resp.status().as_u16(),
+        Err(_) => 500,
+    };
+    metrics::request_finished(start, status, is_streaming);
+
+    result
 }
 
 pub async fn list_models_handler(
@@ -112,10 +123,13 @@ async fn handle_non_streaming(
         req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key));
     }
 
+    let upstream_start = Instant::now();
     let response = req_builder.send().await.map_err(|err| {
         tracing::error!("Failed to send non-streaming request to {}: {:?}", url, err);
+        metrics::upstream_error("chat_completions");
         ProxyError::Http(err)
     })?;
+    metrics::upstream_latency(upstream_start.elapsed().as_secs_f64(), "chat_completions");
 
     if !response.status().is_success() {
         let status = response.status();
@@ -124,6 +138,7 @@ async fn handle_non_streaming(
             .await
             .unwrap_or_else(|_| "Unknown error".to_string());
         tracing::error!("Upstream error ({}): {}", status, error_text);
+        metrics::upstream_error("chat_completions");
         return Err(ProxyError::Upstream(format!(
             "Upstream returned {}: {}",
             status, error_text
@@ -131,6 +146,12 @@ async fn handle_non_streaming(
     }
 
     let openai_resp: openai::OpenAIResponse = response.json().await?;
+
+    metrics::tokens(
+        openai_resp.usage.prompt_tokens,
+        openai_resp.usage.completion_tokens,
+        &openai_req.model,
+    );
 
     if config.verbose {
         tracing::trace!(
@@ -169,10 +190,13 @@ async fn handle_streaming(
         req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key));
     }
 
+    let upstream_start = Instant::now();
     let response = req_builder.send().await.map_err(|err| {
         tracing::error!("Failed to send streaming request to {}: {:?}", url, err);
+        metrics::upstream_error("chat_completions");
         ProxyError::Http(err)
     })?;
+    metrics::upstream_latency(upstream_start.elapsed().as_secs_f64(), "chat_completions");
 
     if !response.status().is_success() {
         let status = response.status();
@@ -181,6 +205,7 @@ async fn handle_streaming(
             .await
             .unwrap_or_else(|_| "Unknown error".to_string());
         tracing::error!("Upstream error ({}) from {}: {}", status, url, error_text);
+        metrics::upstream_error("chat_completions");
         return Err(ProxyError::Upstream(format!(
             "Upstream returned {} from {}: {}",
             status, url, error_text
