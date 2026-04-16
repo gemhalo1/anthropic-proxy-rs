@@ -57,6 +57,11 @@ async-stream = "0.3"
 bytes = "1.9"
 pin-project = "1.1"
 
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.tar.gz"
+pkg-fmt = "tgz"
+bin-dir = "{ bin }"
+
 [profile.release]
 opt-level = "z"        # Optimize for size
 lto = true             # Enable Link Time Optimization
