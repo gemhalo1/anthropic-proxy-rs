@@ -18,11 +18,15 @@ pub fn anthropic_to_openai(
 
     // Use configured model or fall back to the model from the request
     let model = if has_thinking {
-        config.reasoning_model.clone()
+        config
+            .reasoning_model
+            .clone()
             .or_else(|| Some(req.model.clone()))
             .unwrap_or_else(|| req.model.clone())
     } else {
-        config.completion_model.clone()
+        config
+            .completion_model
+            .clone()
             .or_else(|| Some(req.model.clone()))
             .unwrap_or_else(|| req.model.clone())
     };
@@ -130,10 +134,7 @@ fn convert_message(msg: anthropic::Message) -> ProxyResult<Vec<openai::Message>>
                         current_content_parts.push(openai::ContentPart::Text { text });
                     }
                     anthropic::ContentBlock::Image { source } => {
-                        let data_url = format!(
-                            "data:{};base64,{}",
-                            source.media_type, source.data
-                        );
+                        let data_url = format!("data:{};base64,{}", source.media_type, source.data);
                         current_content_parts.push(openai::ContentPart::ImageUrl {
                             image_url: openai::ImageUrl { url: data_url },
                         });
@@ -145,7 +146,7 @@ fn convert_message(msg: anthropic::Message) -> ProxyResult<Vec<openai::Message>>
                             function: openai::FunctionCall {
                                 name,
                                 arguments: serde_json::to_string(&input)
-                                    .map_err(|e| ProxyError::Serialization(e))?,
+                                    .map_err(ProxyError::Serialization)?,
                             },
                         });
                     }
@@ -400,8 +401,8 @@ pub fn openai_to_anthropic(
     // Add tool calls if present
     if let Some(tool_calls) = &choice.message.tool_calls {
         for tool_call in tool_calls {
-            let input: Value = serde_json::from_str(&tool_call.function.arguments)
-                .unwrap_or_else(|_| json!({}));
+            let input: Value =
+                serde_json::from_str(&tool_call.function.arguments).unwrap_or_else(|_| json!({}));
 
             content.push(anthropic::ResponseContent::ToolUse {
                 content_type: "tool_use".to_string(),
@@ -465,17 +466,20 @@ pub fn openai_models_to_anthropic(
 
 /// Map OpenAI finish reason to Anthropic stop reason
 pub fn map_stop_reason(finish_reason: Option<&str>) -> Option<String> {
-    finish_reason.map(|r| match r {
-        "tool_calls" => "tool_use",
-        "stop" => "end_turn",
-        "length" => "max_tokens",
-        _ => "end_turn",
-    }.to_string())
+    finish_reason.map(|r| {
+        match r {
+            "tool_calls" => "tool_use",
+            "stop" => "end_turn",
+            "length" => "max_tokens",
+            _ => "end_turn",
+        }
+        .to_string()
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{clean_schema, openai_to_anthropic, remove_ignored_term, sanitize_system_prompt};
+    use super::*;
     use crate::config::Config;
     use crate::models::{anthropic, openai};
     use serde_json::json;
@@ -626,20 +630,10 @@ mod tests {
         };
 
         let config = Config {
-            port: 3000,
-            base_url: "https://example.com".to_string(),
-            api_key: None,
-            model_map: [(
-                "claude-opus-4-6".to_string(),
-                "openai/gpt-4.1".to_string(),
-            )]
-            .into_iter()
-            .collect(),
-            system_prompt_ignore_terms: vec![],
-            reasoning_model: None,
-            completion_model: None,
-            debug: false,
-            verbose: false,
+            model_map: [("claude-opus-4-6".to_string(), "openai/gpt-4.1".to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
         };
 
         let openai = super::anthropic_to_openai(req, &config).unwrap();
@@ -695,15 +689,8 @@ mod tests {
     #[test]
     fn sanitize_system_prompt_removes_configured_terms() {
         let config = Config {
-            port: 3000,
-            base_url: "https://example.com".to_string(),
-            api_key: None,
-            model_map: Default::default(),
             system_prompt_ignore_terms: vec!["rm -rf".to_string()],
-            reasoning_model: None,
-            completion_model: None,
-            debug: false,
-            verbose: false,
+            ..Default::default()
         };
 
         let sanitized =
@@ -735,15 +722,8 @@ mod tests {
         };
 
         let config = Config {
-            port: 3000,
-            base_url: "https://example.com".to_string(),
-            api_key: None,
-            model_map: Default::default(),
             system_prompt_ignore_terms: vec!["rm -rf".to_string()],
-            reasoning_model: None,
-            completion_model: None,
-            debug: false,
-            verbose: false,
+            ..Default::default()
         };
 
         let openai = super::anthropic_to_openai(req, &config).unwrap();
@@ -754,5 +734,376 @@ mod tests {
             }
             _ => panic!("expected sanitized system prompt"),
         }
+    }
+
+    #[test]
+    fn anthropic_to_openai_converts_tool_definitions() {
+        let req = anthropic::AnthropicRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![anthropic::Message {
+                role: "user".to_string(),
+                content: anthropic::MessageContent::Text("use tool".to_string()),
+            }],
+            max_tokens: 100,
+            system: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: None,
+            tools: Some(vec![anthropic::Tool {
+                name: "read_file".to_string(),
+                description: Some("Read a file".to_string()),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } },
+                    "required": ["path"]
+                }),
+                tool_type: None,
+            }]),
+            metadata: None,
+            extra: json!({}),
+        };
+
+        let config = Config::default();
+        let openai = anthropic_to_openai(req, &config).unwrap();
+
+        let tools = openai.tools.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].tool_type, "function");
+        assert_eq!(tools[0].function.name, "read_file");
+        assert_eq!(
+            tools[0].function.description,
+            Some("Read a file".to_string())
+        );
+    }
+
+    #[test]
+    fn anthropic_to_openai_filters_batch_tools() {
+        let req = anthropic::AnthropicRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![anthropic::Message {
+                role: "user".to_string(),
+                content: anthropic::MessageContent::Text("hi".to_string()),
+            }],
+            max_tokens: 100,
+            system: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: None,
+            tools: Some(vec![anthropic::Tool {
+                name: "batch_tool".to_string(),
+                description: None,
+                input_schema: json!({}),
+                tool_type: Some("BatchTool".to_string()),
+            }]),
+            metadata: None,
+            extra: json!({}),
+        };
+
+        let config = Config::default();
+        let openai = anthropic_to_openai(req, &config).unwrap();
+
+        assert!(openai.tools.is_none());
+    }
+
+    #[test]
+    fn anthropic_to_openai_converts_image_content() {
+        let req = anthropic::AnthropicRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![anthropic::Message {
+                role: "user".to_string(),
+                content: anthropic::MessageContent::Blocks(vec![
+                    anthropic::ContentBlock::Text {
+                        text: "What is this?".to_string(),
+                        cache_control: None,
+                    },
+                    anthropic::ContentBlock::Image {
+                        source: anthropic::ImageSource {
+                            source_type: "base64".to_string(),
+                            media_type: "image/png".to_string(),
+                            data: "iVBOR...".to_string(),
+                        },
+                    },
+                ]),
+            }],
+            max_tokens: 100,
+            system: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: None,
+            tools: None,
+            metadata: None,
+            extra: json!({}),
+        };
+
+        let config = Config::default();
+        let openai = anthropic_to_openai(req, &config).unwrap();
+
+        match &openai.messages[0].content {
+            Some(openai::MessageContent::Parts(parts)) => {
+                assert_eq!(parts.len(), 2);
+                match &parts[1] {
+                    openai::ContentPart::ImageUrl { image_url } => {
+                        assert!(image_url.url.starts_with("data:image/png;base64,"));
+                    }
+                    _ => panic!("expected image_url part"),
+                }
+            }
+            _ => panic!("expected multi-part content"),
+        }
+    }
+
+    #[test]
+    fn anthropic_to_openai_converts_tool_use_and_tool_result() {
+        let req = anthropic::AnthropicRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![
+                anthropic::Message {
+                    role: "assistant".to_string(),
+                    content: anthropic::MessageContent::Blocks(vec![
+                        anthropic::ContentBlock::ToolUse {
+                            id: "tool_1".to_string(),
+                            name: "read_file".to_string(),
+                            input: json!({"path": "/tmp"}),
+                        },
+                    ]),
+                },
+                anthropic::Message {
+                    role: "user".to_string(),
+                    content: anthropic::MessageContent::Blocks(vec![
+                        anthropic::ContentBlock::ToolResult {
+                            tool_use_id: "tool_1".to_string(),
+                            content: "file contents".to_string(),
+                            is_error: None,
+                        },
+                    ]),
+                },
+            ],
+            max_tokens: 100,
+            system: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: None,
+            tools: None,
+            metadata: None,
+            extra: json!({}),
+        };
+
+        let config = Config::default();
+        let openai = anthropic_to_openai(req, &config).unwrap();
+
+        let assistant_msg = &openai.messages[0];
+        let tool_calls = assistant_msg.tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls[0].id, "tool_1");
+        assert_eq!(tool_calls[0].function.name, "read_file");
+
+        let tool_result_msg = &openai.messages[1];
+        assert_eq!(tool_result_msg.role, "tool");
+        assert_eq!(tool_result_msg.tool_call_id, Some("tool_1".to_string()));
+    }
+
+    #[test]
+    fn anthropic_to_openai_converts_multiple_system_prompts() {
+        let req = anthropic::AnthropicRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![anthropic::Message {
+                role: "user".to_string(),
+                content: anthropic::MessageContent::Text("hi".to_string()),
+            }],
+            max_tokens: 100,
+            system: Some(anthropic::SystemPrompt::Multiple(vec![
+                anthropic::SystemMessage {
+                    message_type: "text".to_string(),
+                    text: "You are helpful.".to_string(),
+                    cache_control: None,
+                },
+                anthropic::SystemMessage {
+                    message_type: "text".to_string(),
+                    text: "Be concise.".to_string(),
+                    cache_control: None,
+                },
+            ])),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: None,
+            tools: None,
+            metadata: None,
+            extra: json!({}),
+        };
+
+        let config = Config::default();
+        let openai = anthropic_to_openai(req, &config).unwrap();
+
+        let system_msgs: Vec<_> = openai
+            .messages
+            .iter()
+            .filter(|m| m.role == "system")
+            .collect();
+        assert_eq!(system_msgs.len(), 2);
+    }
+
+    #[test]
+    fn anthropic_to_openai_uses_reasoning_model_when_thinking_enabled() {
+        let req = anthropic::AnthropicRequest {
+            model: "claude-opus-4-6".to_string(),
+            messages: vec![anthropic::Message {
+                role: "user".to_string(),
+                content: anthropic::MessageContent::Text("think hard".to_string()),
+            }],
+            max_tokens: 100,
+            system: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: None,
+            tools: None,
+            metadata: None,
+            extra: json!({"thinking": {"type": "enabled", "budget_tokens": 1000}}),
+        };
+
+        let config = Config {
+            reasoning_model: Some("gpt-4o-reasoning".to_string()),
+            completion_model: Some("gpt-4o-mini".to_string()),
+            ..Default::default()
+        };
+        let openai = anthropic_to_openai(req, &config).unwrap();
+
+        assert_eq!(openai.model, "gpt-4o-reasoning");
+    }
+
+    #[test]
+    fn anthropic_to_openai_uses_completion_model_without_thinking() {
+        let req = anthropic::AnthropicRequest {
+            model: "claude-opus-4-6".to_string(),
+            messages: vec![anthropic::Message {
+                role: "user".to_string(),
+                content: anthropic::MessageContent::Text("quick answer".to_string()),
+            }],
+            max_tokens: 100,
+            system: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: None,
+            tools: None,
+            metadata: None,
+            extra: json!({}),
+        };
+
+        let config = Config {
+            reasoning_model: Some("gpt-4o-reasoning".to_string()),
+            completion_model: Some("gpt-4o-mini".to_string()),
+            ..Default::default()
+        };
+        let openai = anthropic_to_openai(req, &config).unwrap();
+
+        assert_eq!(openai.model, "gpt-4o-mini");
+    }
+
+    #[test]
+    fn openai_to_anthropic_converts_tool_calls_in_response() {
+        let response = openai::OpenAIResponse {
+            id: Some("chatcmpl-1".to_string()),
+            object: None,
+            created: None,
+            model: Some("gpt-4o".to_string()),
+            choices: vec![openai::Choice {
+                index: 0,
+                message: openai::ChoiceMessage {
+                    role: "assistant".to_string(),
+                    content: None,
+                    tool_calls: Some(vec![openai::ToolCall {
+                        id: "call_abc".to_string(),
+                        call_type: "function".to_string(),
+                        function: openai::FunctionCall {
+                            name: "read_file".to_string(),
+                            arguments: "{\"path\":\"/tmp\"}".to_string(),
+                        },
+                    }]),
+                },
+                finish_reason: Some("tool_calls".to_string()),
+            }],
+            usage: openai::Usage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+            },
+            system_fingerprint: None,
+        };
+
+        let anthropic = openai_to_anthropic(response, "fallback").unwrap();
+
+        assert_eq!(anthropic.stop_reason, Some("tool_use".to_string()));
+        assert!(!anthropic.content.is_empty());
+        match &anthropic.content[0] {
+            anthropic::ResponseContent::ToolUse {
+                id, name, input, ..
+            } => {
+                assert_eq!(id, "call_abc");
+                assert_eq!(name, "read_file");
+                assert_eq!(input["path"], "/tmp");
+            }
+            _ => panic!("expected tool_use content"),
+        }
+    }
+
+    #[test]
+    fn map_stop_reason_translates_all_known_reasons() {
+        assert_eq!(map_stop_reason(Some("stop")), Some("end_turn".to_string()));
+        assert_eq!(
+            map_stop_reason(Some("tool_calls")),
+            Some("tool_use".to_string())
+        );
+        assert_eq!(
+            map_stop_reason(Some("length")),
+            Some("max_tokens".to_string())
+        );
+        assert_eq!(
+            map_stop_reason(Some("unknown")),
+            Some("end_turn".to_string())
+        );
+        assert_eq!(map_stop_reason(None), None);
+    }
+
+    #[test]
+    fn clean_schema_recursively_processes_all_of_variants() {
+        let schema = json!({
+            "allOf": [
+                { "type": "object", "properties": { "a": { "type": "string", "format": "uri" } } },
+                { "type": "object", "properties": { "b": { "type": "integer" } } }
+            ]
+        });
+
+        let cleaned = clean_schema(schema);
+
+        assert!(cleaned["allOf"][0]["properties"]["a"]
+            .get("format")
+            .is_none());
+        assert_eq!(cleaned["allOf"][0]["required"], json!([]));
+        assert_eq!(cleaned["allOf"][1]["required"], json!([]));
+    }
+
+    #[test]
+    fn clean_schema_removes_null_values() {
+        let schema = json!({
+            "type": "object",
+            "description": null,
+            "properties": { "a": { "type": "string" } }
+        });
+
+        let cleaned = clean_schema(schema);
+
+        assert!(cleaned.get("description").is_none());
     }
 }
