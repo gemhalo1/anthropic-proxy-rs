@@ -97,6 +97,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     if cli.merge_system_messages {
         config.merge_system_messages = true;
     }
+    if cli.merge_user_messages {
+        config.merge_user_messages = true;
+    }
 
     let log_level = if config.verbose {
         tracing::Level::TRACE

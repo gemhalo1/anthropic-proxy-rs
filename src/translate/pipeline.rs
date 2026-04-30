@@ -10,6 +10,7 @@ pub struct TranslationPolicy {
     pub model_map: BTreeMap<String, String>,
     pub ignore_terms: Vec<String>,
     pub merge_system_messages: bool,
+    pub merge_user_messages: bool,
 }
 
 pub fn translate_request(
@@ -23,19 +24,24 @@ pub fn translate_request(
     if let Some(system) = req.system {
         match system {
             anthropic::SystemPrompt::Single(text) => {
-                openai_messages.push(openai::Message {
-                    role: "system".to_string(),
-                    content: Some(openai::MessageContent::Text(sanitize_prompt(
-                        text,
-                        &policy.ignore_terms,
-                    ))),
-                    tool_calls: None,
-                    tool_call_id: None,
-                    name: None,
-                });
+                if !text.trim().to_ascii_lowercase().starts_with("x-anthropic-billing-header:") {
+                    openai_messages.push(openai::Message {
+                        role: "system".to_string(),
+                        content: Some(openai::MessageContent::Text(sanitize_prompt(
+                            text,
+                            &policy.ignore_terms,
+                        ))),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        name: None,
+                    });
+                }
             }
             anthropic::SystemPrompt::Multiple(messages) => {
                 for msg in messages {
+                    if msg.text.trim().to_ascii_lowercase().starts_with("x-anthropic-billing-header:") {
+                        continue;
+                    }
                     openai_messages.push(openai::Message {
                         role: "system".to_string(),
                         content: Some(openai::MessageContent::Text(sanitize_prompt(
@@ -82,6 +88,10 @@ pub fn translate_request(
 
     for msg in req.messages {
         openai_messages.extend(core::translate_message(msg)?);
+    }
+
+    if policy.merge_user_messages {
+        openai_messages = merge_consecutive_user_messages(openai_messages);
     }
 
     let tools = req.tools.and_then(|tools| {
@@ -194,6 +204,43 @@ pub fn translate_models_list(resp: openai::ModelsListResponse) -> anthropic::Mod
     }
 }
 
+fn merge_consecutive_user_messages(messages: Vec<openai::Message>) -> Vec<openai::Message> {
+    let mut merged = Vec::new();
+    let mut user_texts: Vec<String> = Vec::new();
+
+    for msg in messages {
+        if msg.role == "user" {
+            if let Some(openai::MessageContent::Text(text)) = &msg.content {
+                user_texts.push(text.clone());
+                continue;
+            }
+        }
+        if !user_texts.is_empty() {
+            merged.push(openai::Message {
+                role: "user".to_string(),
+                content: Some(openai::MessageContent::Text(user_texts.join("\n"))),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            });
+            user_texts.clear();
+        }
+        merged.push(msg);
+    }
+
+    if !user_texts.is_empty() {
+        merged.push(openai::Message {
+            role: "user".to_string(),
+            content: Some(openai::MessageContent::Text(user_texts.join("\n"))),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        });
+    }
+
+    merged
+}
+
 fn select_model(req: &anthropic::AnthropicRequest, policy: &TranslationPolicy) -> String {
     let has_thinking = req
         .extra
@@ -252,6 +299,7 @@ mod tests {
             model_map: config.model_map.clone(),
             ignore_terms: config.system_prompt_ignore_terms.clone(),
             merge_system_messages: config.merge_system_messages,
+            merge_user_messages: config.merge_user_messages,
         }
     }
 
@@ -871,6 +919,215 @@ mod tests {
         }
 
         // Second should be user message
+        assert_eq!(openai.messages[1].role, "user");
+    }
+
+    #[test]
+    fn drops_billing_header_single_system_message() {
+        let req = anthropic::AnthropicRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![anthropic::Message {
+                role: "user".to_string(),
+                content: anthropic::MessageContent::Text("hi".to_string()),
+            }],
+            max_tokens: 100,
+            system: Some(anthropic::SystemPrompt::Single(
+                "x-anthropic-billing-header: cc_version=2.1".to_string(),
+            )),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: None,
+            tools: None,
+            metadata: None,
+            extra: json!({}),
+        };
+
+        let openai = translate_request(req, &default_policy()).unwrap();
+        let system_msgs: Vec<_> = openai.messages.iter().filter(|m| m.role == "system").collect();
+        assert!(system_msgs.is_empty(), "billing header should be dropped");
+    }
+
+    #[test]
+    fn drops_billing_header_multiple_system_messages() {
+        let req = anthropic::AnthropicRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![anthropic::Message {
+                role: "user".to_string(),
+                content: anthropic::MessageContent::Text("hi".to_string()),
+            }],
+            max_tokens: 100,
+            system: Some(anthropic::SystemPrompt::Multiple(vec![
+                anthropic::SystemMessage {
+                    message_type: "text".to_string(),
+                    text: "x-anthropic-billing-header: cc_version=2.1".to_string(),
+                    cache_control: None,
+                },
+                anthropic::SystemMessage {
+                    message_type: "text".to_string(),
+                    text: "You are helpful.".to_string(),
+                    cache_control: None,
+                },
+            ])),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: None,
+            tools: None,
+            metadata: None,
+            extra: json!({}),
+        };
+
+        let openai = translate_request(req, &default_policy()).unwrap();
+        let system_msgs: Vec<_> = openai.messages.iter().filter(|m| m.role == "system").collect();
+        assert_eq!(system_msgs.len(), 1);
+        match &system_msgs[0].content {
+            Some(openai::MessageContent::Text(text)) => {
+                assert_eq!(text, "You are helpful.");
+            }
+            _ => panic!("expected text content"),
+        }
+    }
+
+    #[test]
+    fn keeps_non_billing_system_message() {
+        let req = anthropic::AnthropicRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![anthropic::Message {
+                role: "user".to_string(),
+                content: anthropic::MessageContent::Text("hi".to_string()),
+            }],
+            max_tokens: 100,
+            system: Some(anthropic::SystemPrompt::Single("Be helpful.".to_string())),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: None,
+            tools: None,
+            metadata: None,
+            extra: json!({}),
+        };
+
+        let openai = translate_request(req, &default_policy()).unwrap();
+        let system_msgs: Vec<_> = openai.messages.iter().filter(|m| m.role == "system").collect();
+        assert_eq!(system_msgs.len(), 1);
+    }
+
+    #[test]
+    fn merges_consecutive_user_messages() {
+        let req = anthropic::AnthropicRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![
+                anthropic::Message {
+                    role: "user".to_string(),
+                    content: anthropic::MessageContent::Text("hello".to_string()),
+                },
+                anthropic::Message {
+                    role: "user".to_string(),
+                    content: anthropic::MessageContent::Text("world".to_string()),
+                },
+            ],
+            max_tokens: 100,
+            system: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: None,
+            tools: None,
+            metadata: None,
+            extra: json!({}),
+        };
+
+        let mut policy = default_policy();
+        policy.merge_user_messages = true;
+
+        let openai = translate_request(req, &policy).unwrap();
+        assert_eq!(openai.messages.len(), 1);
+        assert_eq!(openai.messages[0].role, "user");
+        match &openai.messages[0].content {
+            Some(openai::MessageContent::Text(text)) => {
+                assert_eq!(text, "hello\nworld");
+            }
+            _ => panic!("expected text content"),
+        }
+    }
+
+    #[test]
+    fn non_consecutive_user_messages_not_merged() {
+        let req = anthropic::AnthropicRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![
+                anthropic::Message {
+                    role: "user".to_string(),
+                    content: anthropic::MessageContent::Text("hello".to_string()),
+                },
+                anthropic::Message {
+                    role: "assistant".to_string(),
+                    content: anthropic::MessageContent::Text("hi".to_string()),
+                },
+                anthropic::Message {
+                    role: "user".to_string(),
+                    content: anthropic::MessageContent::Text("world".to_string()),
+                },
+            ],
+            max_tokens: 100,
+            system: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: None,
+            tools: None,
+            metadata: None,
+            extra: json!({}),
+        };
+
+        let mut policy = default_policy();
+        policy.merge_user_messages = true;
+
+        let openai = translate_request(req, &policy).unwrap();
+        assert_eq!(openai.messages.len(), 3);
+        assert_eq!(openai.messages[0].role, "user");
+        assert_eq!(openai.messages[1].role, "assistant");
+        assert_eq!(openai.messages[2].role, "user");
+    }
+
+    #[test]
+    fn merge_user_disabled_keeps_original_structure() {
+        let req = anthropic::AnthropicRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![
+                anthropic::Message {
+                    role: "user".to_string(),
+                    content: anthropic::MessageContent::Text("hello".to_string()),
+                },
+                anthropic::Message {
+                    role: "user".to_string(),
+                    content: anthropic::MessageContent::Text("world".to_string()),
+                },
+            ],
+            max_tokens: 100,
+            system: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: None,
+            tools: None,
+            metadata: None,
+            extra: json!({}),
+        };
+
+        let policy = default_policy();
+        // merge_user_messages is false by default
+
+        let openai = translate_request(req, &policy).unwrap();
+        assert_eq!(openai.messages.len(), 2);
+        assert_eq!(openai.messages[0].role, "user");
         assert_eq!(openai.messages[1].role, "user");
     }
 }

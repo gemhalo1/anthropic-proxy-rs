@@ -38,6 +38,10 @@ pub struct Cli {
     #[arg(long = "merge-system")]
     pub merge_system_messages: bool,
 
+    /// Merge consecutive user messages into one (joined by newlines)
+    #[arg(long = "merge-user")]
+    pub merge_user_messages: bool,
+
     /// Run as background daemon
     #[arg(long)]
     pub daemon: bool,

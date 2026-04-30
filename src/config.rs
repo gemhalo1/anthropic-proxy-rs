@@ -12,6 +12,7 @@ pub struct Config {
     pub reasoning_model: Option<String>,
     pub completion_model: Option<String>,
     pub merge_system_messages: bool,
+    pub merge_user_messages: bool,
     pub debug: bool,
     pub verbose: bool,
 }
@@ -27,6 +28,7 @@ impl Default for Config {
             reasoning_model: None,
             completion_model: None,
             merge_system_messages: false,
+            merge_user_messages: false,
             debug: false,
             verbose: false,
         }
@@ -133,6 +135,7 @@ impl Config {
             reasoning_model,
             completion_model,
             merge_system_messages: false,
+            merge_user_messages: false,
             debug,
             verbose,
         })
