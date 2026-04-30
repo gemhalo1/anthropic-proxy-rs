@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::config::{Config, ResolvedRoute};
 use crate::error::{ProxyError, ProxyResult};
 use crate::metrics;
 use crate::models::{anthropic, openai};
@@ -23,9 +23,10 @@ pub async fn proxy_handler(
     let is_streaming = req.stream.unwrap_or(false);
     let start = Instant::now();
     let msg_count = req.messages.len();
+    let requested_model = req.model.clone();
 
     tracing::info!(
-        model = req.model.as_str(),
+        model = requested_model.as_str(),
         stream = is_streaming,
         messages = msg_count,
         "Received request"
@@ -39,8 +40,23 @@ pub async fn proxy_handler(
         );
     }
 
-    let policy = translation_policy(&config);
-    let openai_req = pipeline::translate_request(req, &policy)?;
+    let route = config.resolve_model(&requested_model).map_err(|e| ProxyError::Config(e.to_string()))?;
+
+    let policy = pipeline::TranslationPolicy {
+        reasoning_model: route.reasoning_model.clone()
+            .or_else(|| config.reasoning_model.clone()),
+        completion_model: route.completion_model.clone()
+            .or_else(|| config.completion_model.clone()),
+        model_map: config.model_map.clone(),
+        ignore_terms: config.system_prompt_ignore_terms.clone(),
+        merge_system_messages: config.merge_system_messages,
+        merge_user_messages: config.merge_user_messages,
+    };
+
+    let mut req_with_target = req;
+    req_with_target.model = route.target.clone();
+
+    let openai_req = pipeline::translate_request(req_with_target, &policy)?;
 
     if config.verbose {
         tracing::trace!(
@@ -49,10 +65,16 @@ pub async fn proxy_handler(
         );
     }
 
-    let result = if is_streaming {
-        handle_streaming(config, client, openai_req, start).await
+    let result = if route.is_legacy {
+        if is_streaming {
+            handle_legacy_streaming(config, client, openai_req, start).await
+        } else {
+            handle_legacy_non_streaming(config, client, openai_req, start).await
+        }
+    } else if is_streaming {
+        handle_routed_streaming(config, client, openai_req, start, route).await
     } else {
-        handle_non_streaming(config, client, openai_req, start).await
+        handle_routed_non_streaming(config, client, openai_req, start, route).await
     };
 
     let status = match &result {
@@ -114,22 +136,170 @@ pub async fn list_models_handler(
     ))
 }
 
-fn translation_policy(config: &Config) -> pipeline::TranslationPolicy {
-    pipeline::TranslationPolicy {
-        reasoning_model: config.reasoning_model.clone(),
-        completion_model: config.completion_model.clone(),
-        model_map: config.model_map.clone(),
-        ignore_terms: config.system_prompt_ignore_terms.clone(),
-        merge_system_messages: config.merge_system_messages,
-        merge_user_messages: config.merge_user_messages,
-    }
-}
-
 fn is_retriable_status(status: u16) -> bool {
     matches!(status, 429 | 500..=599)
 }
 
-async fn handle_non_streaming(
+async fn handle_routed_non_streaming(
+    config: Arc<Config>,
+    client: Client,
+    openai_req: openai::OpenAIRequest,
+    request_start: Instant,
+    route: ResolvedRoute,
+) -> ProxyResult<Response> {
+    let model = openai_req.model.clone();
+
+    let mut urls_to_try = vec![(route.base_url.clone(), route.api_key.clone())];
+
+    if route.allow_failover {
+        let failovers = config.failover_upstreams(&model, &route.upstream_name);
+        for fo in &failovers {
+            urls_to_try.push((fo.base_url.clone(), fo.api_key.clone()));
+        }
+    }
+
+    let mut last_err = None;
+
+    for (url, api_key) in &urls_to_try {
+        tracing::debug!("Sending non-streaming request to {} (model: {})", url, model);
+
+        let mut req_builder = client
+            .post(url)
+            .json(&openai_req)
+            .timeout(Duration::from_secs(300));
+
+        if let Some(key) = api_key {
+            req_builder = req_builder.header("Authorization", format!("Bearer {}", key));
+        }
+
+        let upstream_start = Instant::now();
+        let response = match req_builder.send().await {
+            Ok(resp) => {
+                metrics::upstream_latency(upstream_start.elapsed().as_secs_f64(), "chat_completions");
+                resp
+            }
+            Err(err) => {
+                tracing::warn!("Failed to reach {}: {:?}", url, err);
+                metrics::upstream_error("chat_completions");
+                last_err = Some(ProxyError::Http(err));
+                continue;
+            }
+        };
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+            tracing::warn!("Upstream {} returned {}: {}", url, status, error_text);
+            metrics::upstream_error("chat_completions");
+
+            if is_retriable_status(status.as_u16()) {
+                last_err = Some(ProxyError::Upstream(format!("Upstream returned {}: {}", status, error_text)));
+                continue;
+            }
+            return Err(ProxyError::Upstream(format!("Upstream returned {}: {}", status, error_text)));
+        }
+
+        let openai_resp: openai::OpenAIResponse = response.json().await?;
+        let prompt_tokens = openai_resp.usage.prompt_tokens;
+        let completion_tokens = openai_resp.usage.completion_tokens;
+
+        tracing::info!(model = model.as_str(), ttfb_ms = request_start.elapsed().as_millis(), "First token received");
+        metrics::tokens(prompt_tokens, completion_tokens, &model);
+
+        if config.verbose {
+            tracing::trace!("Received OpenAI response: {}", serde_json::to_string_pretty(&openai_resp).unwrap_or_default());
+        }
+
+        let anthropic_resp = pipeline::translate_response(openai_resp, &model)?;
+
+        tracing::info!(
+            model = model.as_str(),
+            total_ms = request_start.elapsed().as_millis(),
+            prompt_tokens = prompt_tokens,
+            completion_tokens = completion_tokens,
+            "Request completed"
+        );
+
+        return Ok(Json(anthropic_resp).into_response());
+    }
+
+    Err(last_err.unwrap_or_else(|| ProxyError::Upstream("All upstreams failed".to_string())))
+}
+
+async fn handle_routed_streaming(
+    config: Arc<Config>,
+    client: Client,
+    openai_req: openai::OpenAIRequest,
+    request_start: Instant,
+    route: ResolvedRoute,
+) -> ProxyResult<Response> {
+    let model = openai_req.model.clone();
+
+    let mut urls_to_try = vec![(route.base_url.clone(), route.api_key.clone())];
+
+    if route.allow_failover {
+        let failovers = config.failover_upstreams(&model, &route.upstream_name);
+        for fo in &failovers {
+            urls_to_try.push((fo.base_url.clone(), fo.api_key.clone()));
+        }
+    }
+
+    let mut last_err = None;
+
+    for (url, api_key) in &urls_to_try {
+        tracing::debug!("Sending streaming request to {} (model: {})", url, model);
+
+        let mut req_builder = client
+            .post(url)
+            .json(&openai_req)
+            .timeout(Duration::from_secs(300));
+
+        if let Some(key) = api_key {
+            req_builder = req_builder.header("Authorization", format!("Bearer {}", key));
+        }
+
+        let upstream_start = Instant::now();
+        let response = match req_builder.send().await {
+            Ok(resp) => {
+                metrics::upstream_latency(upstream_start.elapsed().as_secs_f64(), "chat_completions");
+                resp
+            }
+            Err(err) => {
+                tracing::warn!("Failed to reach {}: {:?}", url, err);
+                metrics::upstream_error("chat_completions");
+                last_err = Some(ProxyError::Http(err));
+                continue;
+            }
+        };
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+            tracing::warn!("Upstream {} returned {}: {}", url, status, error_text);
+            metrics::upstream_error("chat_completions");
+
+            if is_retriable_status(status.as_u16()) {
+                last_err = Some(ProxyError::Upstream(format!("Upstream returned {}: {}", status, error_text)));
+                continue;
+            }
+            return Err(ProxyError::Upstream(format!("Upstream returned {}: {}", status, error_text)));
+        }
+
+        let upstream = response.bytes_stream();
+        let sse_stream = create_sse_stream(upstream, model.clone(), request_start);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("Content-Type", HeaderValue::from_static("text/event-stream"));
+        headers.insert("Cache-Control", HeaderValue::from_static("no-cache"));
+        headers.insert("Connection", HeaderValue::from_static("keep-alive"));
+
+        return Ok((headers, Body::from_stream(sse_stream)).into_response());
+    }
+
+    Err(last_err.unwrap_or_else(|| ProxyError::Upstream("All upstreams failed".to_string())))
+}
+
+async fn handle_legacy_non_streaming(
     config: Arc<Config>,
     client: Client,
     openai_req: openai::OpenAIRequest,
@@ -237,7 +407,7 @@ async fn handle_non_streaming(
     Err(last_err.unwrap_or_else(|| ProxyError::Upstream("All upstreams failed".to_string())))
 }
 
-async fn handle_streaming(
+async fn handle_legacy_streaming(
     config: Arc<Config>,
     client: Client,
     openai_req: openai::OpenAIRequest,
@@ -248,11 +418,7 @@ async fn handle_streaming(
     let mut last_err = None;
 
     for url in &urls {
-        tracing::debug!(
-            "Sending streaming request to {} (model: {})",
-            url,
-            model
-        );
+        tracing::debug!("Sending streaming request to {} (model: {})", url, model);
 
         let mut req_builder = client
             .post(url)
@@ -303,11 +469,7 @@ async fn handle_streaming(
         }
 
         let upstream = response.bytes_stream();
-        let sse_stream = create_sse_stream(
-            upstream,
-            model.clone(),
-            request_start,
-        );
+        let sse_stream = create_sse_stream(upstream, model.clone(), request_start);
 
         let mut headers = HeaderMap::new();
         headers.insert(
