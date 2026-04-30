@@ -12,9 +12,10 @@ use axum::{
 };
 use clap::Parser;
 use cli::{Cli, Command};
-use config::Config;
+use config::{Config, UpstreamConfig};
 use daemonize::Daemonize;
 use reqwest::Client;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use tower_http::{
     cors::{Any, CorsLayer},
@@ -73,8 +74,119 @@ fn main() -> anyhow::Result<()> {
     runtime.block_on(async_main(cli))
 }
 
+fn find_config_file(cli: &Cli) -> Option<std::path::PathBuf> {
+    if let Some(path) = &cli.config_file {
+        if path.exists() {
+            return Some(path.clone());
+        }
+        eprintln!("⚠️  WARNING: Config file not found: {}", path.display());
+        return None;
+    }
+
+    let cwd_config = std::path::PathBuf::from("anthropic-proxy.json");
+    if cwd_config.exists() {
+        return Some(cwd_config);
+    }
+
+    if let Ok(home) = std::env::var("HOME") {
+        let home_config = std::path::PathBuf::from(home).join(".anthropic-proxy.json");
+        if home_config.exists() {
+            return Some(home_config);
+        }
+    }
+
+    let etc_config = std::path::PathBuf::from("/etc/anthropic-proxy/config.json");
+    if etc_config.exists() {
+        return Some(etc_config);
+    }
+
+    None
+}
+
+fn merge_env_overrides(config: &mut Config) {
+    // Individual env var overrides (CLI args > env vars > config file > defaults)
+    if let Ok(port) = std::env::var("PORT") {
+        if let Ok(p) = port.parse::<u16>() {
+            config.port = p;
+        }
+    }
+    if std::env::var("DEBUG")
+        .map(|v| v == "1" || v.to_lowercase() == "true")
+        .unwrap_or(false)
+    {
+        config.debug = true;
+    }
+    if std::env::var("VERBOSE")
+        .map(|v| v == "1" || v.to_lowercase() == "true")
+        .unwrap_or(false)
+    {
+        config.verbose = true;
+    }
+    if let Ok(key) = std::env::var("UPSTREAM_API_KEY")
+        .or_else(|_| std::env::var("OPENROUTER_API_KEY"))
+    {
+        if !key.is_empty() {
+            config.api_key = Some(key);
+        }
+    }
+    if let Ok(model) = std::env::var("REASONING_MODEL") {
+        config.reasoning_model = Some(model);
+    }
+    if let Ok(model) = std::env::var("COMPLETION_MODEL") {
+        config.completion_model = Some(model);
+    }
+
+    let env_terms = std::env::var("ANTHROPIC_PROXY_SYSTEM_PROMPT_IGNORE_TERMS")
+        .ok()
+        .map(|value| Config::parse_system_prompt_ignore_terms(&value))
+        .unwrap_or_default();
+    if !env_terms.is_empty() {
+        config.system_prompt_ignore_terms.extend(env_terms);
+        Config::dedupe_ignore_terms(&mut config.system_prompt_ignore_terms);
+    }
+
+    // UPSTREAM_BASE_URL env var overrides config file upstreams entirely
+    if let Ok(raw_urls) = std::env::var("UPSTREAM_BASE_URL")
+        .or_else(|_| std::env::var("ANTHROPIC_PROXY_BASE_URL"))
+    {
+        if let Ok(urls) = Config::parse_upstream_urls(&raw_urls) {
+            config.upstream_urls = urls.clone();
+            config.upstreams.clear();
+            for url in &urls {
+                let name = format!(
+                    "upstream_{}",
+                    url.replace(['.', '/', ':'], "_")
+                        .trim_end_matches('_')
+                );
+                config.upstreams.insert(
+                    name,
+                    UpstreamConfig {
+                        base_url: url.clone(),
+                        api_key: config.api_key.clone(),
+                        models: BTreeMap::new(),
+                    },
+                );
+            }
+        }
+    }
+
+    // ANTHROPIC_PROXY_MODEL_MAP is additive
+    if let Ok(value) = std::env::var("ANTHROPIC_PROXY_MODEL_MAP") {
+        if let Ok(env_map) = Config::parse_model_map(&value) {
+            config.model_map.extend(env_map);
+        }
+    }
+}
+
 async fn async_main(cli: Cli) -> anyhow::Result<()> {
-    let mut config = Config::from_env_with_path(cli.config)?;
+    let mut config = if let Some(config_path) = find_config_file(&cli) {
+        eprintln!("📄 Loaded config from: {}", config_path.display());
+        let mut config = Config::from_json_file(&config_path)?;
+        merge_env_overrides(&mut config);
+        config
+    } else {
+        Config::from_env_with_path(cli.config)?
+    };
 
     if cli.debug {
         config.debug = true;
@@ -149,6 +261,23 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             .collect::<Vec<_>>()
             .join("; ");
         tracing::info!("Model map: {}", entries);
+    }
+
+    if !config.upstreams.is_empty() {
+        tracing::info!(
+            "Configured upstreams: {}",
+            config.upstreams.keys().map(|k| k.as_str()).collect::<Vec<_>>().join(", ")
+        );
+        let total_models = config
+            .upstreams
+            .values()
+            .map(|u| u.models.len())
+            .sum::<usize>();
+        tracing::info!(
+            "Configured models: {} across {} upstreams",
+            total_models,
+            config.upstreams.len()
+        );
     }
 
     let metrics_handle = metrics::install();

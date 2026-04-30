@@ -217,7 +217,7 @@ impl Config {
             .collect()
     }
 
-    fn parse_upstream_urls(raw: &str) -> Result<Vec<String>> {
+    pub fn parse_upstream_urls(raw: &str) -> Result<Vec<String>> {
         let urls: Vec<String> = raw
             .split(';')
             .map(str::trim)
