@@ -1,4 +1,4 @@
-use crate::config::{Config, ResolvedRoute};
+use crate::config::{Config, ModelsListMode, ResolvedRoute};
 use crate::error::{ProxyError, ProxyResult};
 use crate::metrics;
 use crate::models::{anthropic, openai};
@@ -90,6 +90,82 @@ pub async fn list_models_handler(
     Extension(config): Extension<Arc<Config>>,
     Extension(client): Extension<Client>,
 ) -> ProxyResult<Response> {
+    match config.models_list_mode {
+        ModelsListMode::Static => {
+            let raw_models = config.static_models_list();
+            let data: Vec<anthropic::ModelInfo> = raw_models
+                .into_iter()
+                .map(|(id, display_name)| anthropic::ModelInfo {
+                    id,
+                    display_name,
+                    created_at: "1970-01-01T00:00:00Z".to_string(),
+                    model_type: "model".to_string(),
+                })
+                .collect();
+
+            let first_id = data.first().map(|m| m.id.clone());
+            let last_id = data.last().map(|m| m.id.clone());
+
+            Ok(Json(anthropic::ModelsListResponse {
+                data,
+                first_id,
+                has_more: false,
+                last_id,
+            })
+            .into_response())
+        }
+        ModelsListMode::Upstream => {
+            list_models_from_upstream(&config, &client).await
+        }
+        ModelsListMode::Merge => {
+            let mut config_models = config.static_models_list();
+            let config_ids: std::collections::HashSet<String> =
+                config_models.iter().map(|(id, _)| id.clone()).collect();
+            let config_bare_targets: std::collections::HashSet<String> =
+                config_models.iter().map(|(_, d)| d.clone()).collect();
+
+            let upstream_resp =
+                list_models_from_upstream_raw(&config, &client).await?;
+
+            for model in &upstream_resp.data {
+                if config_ids.contains(&model.id)
+                    || config_bare_targets.contains(&model.id)
+                {
+                    continue;
+                }
+                config_models.push((model.id.clone(), model.id.clone()));
+            }
+
+            config_models.sort_by(|a, b| a.0.cmp(&b.0));
+
+            let data: Vec<anthropic::ModelInfo> = config_models
+                .into_iter()
+                .map(|(id, display_name)| anthropic::ModelInfo {
+                    id,
+                    display_name,
+                    created_at: "1970-01-01T00:00:00Z".to_string(),
+                    model_type: "model".to_string(),
+                })
+                .collect();
+
+            let first_id = data.first().map(|m| m.id.clone());
+            let last_id = data.last().map(|m| m.id.clone());
+
+            Ok(Json(anthropic::ModelsListResponse {
+                data,
+                first_id,
+                has_more: false,
+                last_id,
+            })
+            .into_response())
+        }
+    }
+}
+
+async fn list_models_from_upstream(
+    config: &Config,
+    client: &Client,
+) -> ProxyResult<Response> {
     let urls = config.models_urls();
     let mut last_err = None;
 
@@ -125,6 +201,46 @@ pub async fn list_models_handler(
             }
             Err(err) => {
                 tracing::warn!("Failed to reach {}: {:?}", url, err);
+                last_err = Some(format!("HTTP error: {}", err));
+                continue;
+            }
+        }
+    }
+
+    Err(ProxyError::Upstream(
+        last_err.unwrap_or_else(|| "All upstreams failed".to_string()),
+    ))
+}
+
+async fn list_models_from_upstream_raw(
+    config: &Config,
+    client: &Client,
+) -> ProxyResult<openai::ModelsListResponse> {
+    let urls = config.models_urls();
+    let mut last_err = None;
+
+    for url in &urls {
+        let mut req_builder = client.get(url).timeout(Duration::from_secs(60));
+        if let Some(api_key) = &config.api_key {
+            req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key));
+        }
+
+        match req_builder.send().await {
+            Ok(response) if response.status().is_success() => {
+                return Ok(response.json().await?);
+            }
+            Ok(response) => {
+                let status = response.status();
+                if is_retriable_status(status.as_u16()) {
+                    last_err = Some(format!("Upstream returned {}", status));
+                    continue;
+                }
+                return Err(ProxyError::Upstream(format!(
+                    "Upstream returned {}",
+                    status
+                )));
+            }
+            Err(err) => {
                 last_err = Some(format!("HTTP error: {}", err));
                 continue;
             }

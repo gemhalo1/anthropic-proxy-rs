@@ -64,7 +64,6 @@ pub struct Config {
     pub merge_user_messages: bool,
     pub debug: bool,
     pub verbose: bool,
-    #[allow(dead_code)] // Used by list_models_handler in Task 5
     pub models_list_mode: ModelsListMode,
     pub upstreams: BTreeMap<String, UpstreamConfig>,
 }
