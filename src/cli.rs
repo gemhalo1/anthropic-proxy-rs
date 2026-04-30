@@ -18,6 +18,10 @@ pub struct Cli {
     #[arg(short, long, value_name = "FILE")]
     pub config: Option<PathBuf>,
 
+    /// Path to JSON config file (overrides default search path)
+    #[arg(long = "config-file", value_name = "FILE")]
+    pub config_file: Option<PathBuf>,
+
     /// Enable debug logging (same as DEBUG=true)
     #[arg(short, long)]
     pub debug: bool,
