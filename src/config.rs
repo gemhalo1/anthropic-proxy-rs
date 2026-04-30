@@ -1,6 +1,55 @@
 use anyhow::{bail, Result};
 use reqwest::Url;
-use std::{collections::BTreeMap, env, path::PathBuf};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::BTreeMap,
+    env,
+    path::{Path, PathBuf},
+};
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelsListMode {
+    #[default]
+    Static,
+    Upstream,
+    Merge,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpstreamConfig {
+    pub base_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    pub models: BTreeMap<String, ModelConfig>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModelConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(default)]
+    pub allow_failover: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_model: Option<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct ResolvedRoute {
+    pub upstream_name: String,
+    pub target: String,
+    pub base_url: String,
+    pub api_key: Option<String>,
+    pub allow_failover: bool,
+    pub reasoning_model: Option<String>,
+    pub completion_model: Option<String>,
+    pub is_legacy: bool,
+    pub legacy_urls: Vec<String>,
+    pub legacy_api_key: Option<String>,
+}
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -15,6 +64,9 @@ pub struct Config {
     pub merge_user_messages: bool,
     pub debug: bool,
     pub verbose: bool,
+    #[allow(dead_code)] // Used by list_models_handler in Task 5
+    pub models_list_mode: ModelsListMode,
+    pub upstreams: BTreeMap<String, UpstreamConfig>,
 }
 
 impl Default for Config {
@@ -31,6 +83,8 @@ impl Default for Config {
             merge_user_messages: false,
             debug: false,
             verbose: false,
+            models_list_mode: ModelsListMode::Static,
+            upstreams: BTreeMap::new(),
         }
     }
 }
@@ -138,6 +192,8 @@ impl Config {
             merge_user_messages: false,
             debug,
             verbose,
+            models_list_mode: ModelsListMode::Static,
+            upstreams: BTreeMap::new(),
         })
     }
 
@@ -328,9 +384,199 @@ impl Config {
     }
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+struct FileConfig {
+    port: Option<u16>,
+    debug: Option<bool>,
+    verbose: Option<bool>,
+    merge_system_messages: Option<bool>,
+    merge_user_messages: Option<bool>,
+    system_prompt_ignore_terms: Option<Vec<String>>,
+    reasoning_model: Option<String>,
+    completion_model: Option<String>,
+    models_list_mode: Option<ModelsListMode>,
+    upstreams: BTreeMap<String, UpstreamConfig>,
+}
+
+#[allow(dead_code)]
+impl Config {
+    pub fn from_json_file(path: &Path) -> Result<Self> {
+        let content = std::fs::read_to_string(path)?;
+        let file_config: FileConfig = serde_json::from_str(&content)?;
+
+        let mut system_prompt_ignore_terms =
+            file_config.system_prompt_ignore_terms.unwrap_or_default();
+        Self::dedupe_ignore_terms(&mut system_prompt_ignore_terms);
+
+        let upstream_urls: Vec<String> = file_config
+            .upstreams
+            .values()
+            .map(|u| u.base_url.clone())
+            .collect();
+
+        let api_key = None;
+
+        let mut model_map = BTreeMap::new();
+        for (upstream_name, upstream) in &file_config.upstreams {
+            for (bare_name, model_conf) in &upstream.models {
+                let namespaced_id = format!("{}/{}", upstream_name, bare_name);
+                let target = model_conf.target.as_deref().unwrap_or(bare_name);
+                if target != bare_name {
+                    model_map.insert(namespaced_id, target.to_string());
+                }
+            }
+        }
+
+        // Validate upstream URLs
+        for (name, upstream) in &file_config.upstreams {
+            Self::resolve_chat_completions_url(&upstream.base_url)
+                .map_err(|e| anyhow::anyhow!("Upstream '{}': {}", name, e))?;
+        }
+
+        Ok(Config {
+            port: file_config.port.unwrap_or(3000),
+            debug: file_config.debug.unwrap_or(false),
+            verbose: file_config.verbose.unwrap_or(false),
+            merge_system_messages: file_config.merge_system_messages.unwrap_or(false),
+            merge_user_messages: file_config.merge_user_messages.unwrap_or(false),
+            reasoning_model: file_config.reasoning_model,
+            completion_model: file_config.completion_model,
+            models_list_mode: file_config.models_list_mode.unwrap_or_default(),
+            upstreams: file_config.upstreams,
+            system_prompt_ignore_terms,
+            upstream_urls,
+            api_key,
+            model_map,
+        })
+    }
+
+    pub fn resolve_model(&self, model: &str) -> Result<ResolvedRoute> {
+        // Step 1: Prefix match — split on first /
+        if let Some((prefix, remainder)) = model.split_once('/') {
+            if let Some(upstream) = self.upstreams.get(prefix) {
+                if let Some(model_conf) = upstream.models.get(remainder) {
+                    let target = model_conf.target.as_deref().unwrap_or(remainder);
+                    let chat_url = Self::resolve_chat_completions_url(&upstream.base_url)?;
+                    let api_key = upstream.api_key.clone().or_else(|| self.api_key.clone());
+
+                    return Ok(ResolvedRoute {
+                        upstream_name: prefix.to_string(),
+                        target: target.to_string(),
+                        base_url: chat_url,
+                        api_key,
+                        allow_failover: model_conf.allow_failover,
+                        reasoning_model: model_conf.reasoning_model.clone(),
+                        completion_model: model_conf.completion_model.clone(),
+                        is_legacy: false,
+                        legacy_urls: Vec::new(),
+                        legacy_api_key: None,
+                    });
+                }
+            }
+        }
+
+        // Step 2: Bare name match — iterate upstreams in alphabetical order
+        for (upstream_name, upstream) in &self.upstreams {
+            if let Some(model_conf) = upstream.models.get(model) {
+                let target = model_conf.target.as_deref().unwrap_or(model);
+                let chat_url = Self::resolve_chat_completions_url(&upstream.base_url)?;
+                let api_key = upstream.api_key.clone().or_else(|| self.api_key.clone());
+
+                return Ok(ResolvedRoute {
+                    upstream_name: upstream_name.clone(),
+                    target: target.to_string(),
+                    base_url: chat_url,
+                    api_key,
+                    allow_failover: model_conf.allow_failover,
+                    reasoning_model: model_conf.reasoning_model.clone(),
+                    completion_model: model_conf.completion_model.clone(),
+                    is_legacy: false,
+                    legacy_urls: Vec::new(),
+                    legacy_api_key: None,
+                });
+            }
+        }
+
+        // Step 3: No match found — fall back to legacy behavior
+        Ok(ResolvedRoute {
+            upstream_name: String::new(),
+            target: model.to_string(),
+            base_url: String::new(),
+            api_key: None,
+            allow_failover: false,
+            reasoning_model: None,
+            completion_model: None,
+            is_legacy: true,
+            legacy_urls: self.chat_completions_urls(),
+            legacy_api_key: self.api_key.clone(),
+        })
+    }
+
+    pub fn failover_upstreams(&self, model: &str, exclude_upstream: &str) -> Vec<ResolvedRoute> {
+        let mut alternatives = Vec::new();
+
+        let resolved = self.resolve_model(model).ok();
+        let original_target = resolved
+            .as_ref()
+            .map(|r| r.target.as_str())
+            .unwrap_or(model);
+        let bare_part = model
+            .split_once('/')
+            .map(|(_, remainder)| remainder)
+            .unwrap_or(model);
+
+        for (upstream_name, upstream) in &self.upstreams {
+            if upstream_name == exclude_upstream {
+                continue;
+            }
+
+            for (bare_name, model_conf) in &upstream.models {
+                let target = model_conf.target.as_deref().unwrap_or(bare_name);
+                if bare_name == bare_part || target == original_target {
+                    if let Ok(chat_url) = Self::resolve_chat_completions_url(&upstream.base_url) {
+                        let api_key = upstream.api_key.clone().or_else(|| self.api_key.clone());
+                        alternatives.push(ResolvedRoute {
+                            upstream_name: upstream_name.clone(),
+                            target: target.to_string(),
+                            base_url: chat_url,
+                            api_key,
+                            allow_failover: model_conf.allow_failover,
+                            reasoning_model: model_conf.reasoning_model.clone(),
+                            completion_model: model_conf.completion_model.clone(),
+                            is_legacy: false,
+                            legacy_urls: Vec::new(),
+                            legacy_api_key: None,
+                        });
+                    }
+                    break;
+                }
+            }
+        }
+
+        alternatives
+    }
+
+    pub fn static_models_list(&self) -> Vec<(String, String)> {
+        let mut models = Vec::new();
+
+        for (upstream_name, upstream) in &self.upstreams {
+            for (bare_name, model_conf) in &upstream.models {
+                let namespaced_id = format!("{}/{}", upstream_name, bare_name);
+                let display_name = model_conf.target.as_deref().unwrap_or(bare_name);
+                models.push((namespaced_id, display_name.to_string()));
+            }
+        }
+
+        models.sort_by(|a, b| a.0.cmp(&b.0));
+        models
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Config;
+    use super::*;
+    use std::io::Write;
 
     #[test]
     fn base_url_without_version_defaults_to_v1_endpoint() {
@@ -554,5 +800,213 @@ mod tests {
         assert_eq!(urls.len(), 2);
         assert_eq!(urls[0], "https://openrouter.ai/api/v1/chat/completions");
         assert_eq!(urls[1], "https://api.openai.com/v1/chat/completions");
+    }
+
+    #[test]
+    fn load_config_from_json_file() {
+        let json = serde_json::json!({
+            "port": 8080,
+            "debug": true,
+            "models_list_mode": "static",
+            "upstreams": {
+                "openai": {
+                    "base_url": "https://api.openai.com",
+                    "api_key": "sk-test123",
+                    "models": {
+                        "gpt-4.1": {},
+                        "o1-pro": { "target": "o1-pro" }
+                    }
+                }
+            }
+        });
+
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(serde_json::to_string_pretty(&json).unwrap().as_bytes())
+            .unwrap();
+
+        let config = Config::from_json_file(tmp.path()).unwrap();
+        assert_eq!(config.port, 8080);
+        assert!(config.debug);
+        assert_eq!(config.models_list_mode, ModelsListMode::Static);
+        assert_eq!(config.upstreams.len(), 1);
+
+        let upstream = &config.upstreams["openai"];
+        assert_eq!(upstream.base_url, "https://api.openai.com");
+        assert_eq!(upstream.api_key.as_deref(), Some("sk-test123"));
+        assert_eq!(upstream.models.len(), 2);
+
+        let gpt_model = &upstream.models["gpt-4.1"];
+        assert!(gpt_model.target.is_none());
+        assert!(!gpt_model.allow_failover);
+
+        let o1_model = &upstream.models["o1-pro"];
+        assert_eq!(o1_model.target.as_deref(), Some("o1-pro"));
+    }
+
+    #[test]
+    fn resolve_model_prefix_match() {
+        let config = Config {
+            upstreams: BTreeMap::from([(
+                "openai".to_string(),
+                UpstreamConfig {
+                    base_url: "https://api.openai.com".to_string(),
+                    api_key: Some("sk-test".to_string()),
+                    models: BTreeMap::from([(
+                        "gpt-4.1".to_string(),
+                        ModelConfig {
+                            target: Some("gpt-4.1".to_string()),
+                            allow_failover: false,
+                            reasoning_model: None,
+                            completion_model: None,
+                        },
+                    )]),
+                },
+            )]),
+            ..Default::default()
+        };
+
+        let route = config.resolve_model("openai/gpt-4.1").unwrap();
+        assert_eq!(route.upstream_name, "openai");
+        assert_eq!(route.target, "gpt-4.1");
+        assert_eq!(route.base_url, "https://api.openai.com/v1/chat/completions");
+        assert_eq!(route.api_key.as_deref(), Some("sk-test"));
+        assert!(!route.allow_failover);
+    }
+
+    #[test]
+    fn resolve_model_bare_name_match() {
+        let config = Config {
+            upstreams: BTreeMap::from([(
+                "openai".to_string(),
+                UpstreamConfig {
+                    base_url: "https://api.openai.com".to_string(),
+                    api_key: None,
+                    models: BTreeMap::from([(
+                        "gpt-4.1".to_string(),
+                        ModelConfig {
+                            target: Some("gpt-4.1".to_string()),
+                            allow_failover: false,
+                            reasoning_model: None,
+                            completion_model: None,
+                        },
+                    )]),
+                },
+            )]),
+            ..Default::default()
+        };
+
+        let route = config.resolve_model("gpt-4.1").unwrap();
+        assert_eq!(route.upstream_name, "openai");
+        assert_eq!(route.target, "gpt-4.1");
+    }
+
+    #[test]
+    fn resolve_model_no_match_returns_legacy() {
+        let config = Config {
+            upstream_urls: vec!["https://api.openai.com".to_string()],
+            api_key: Some("sk-global".to_string()),
+            ..Default::default()
+        };
+
+        let route = config.resolve_model("unknown-model").unwrap();
+        assert!(route.is_legacy);
+        assert_eq!(route.target, "unknown-model");
+    }
+
+    #[test]
+    fn static_models_list_from_config() {
+        let config = Config {
+            upstreams: BTreeMap::from([
+                (
+                    "openai".to_string(),
+                    UpstreamConfig {
+                        base_url: "https://api.openai.com".to_string(),
+                        api_key: None,
+                        models: BTreeMap::from([(
+                            "gpt-4.1".to_string(),
+                            ModelConfig {
+                                target: Some("gpt-4.1".to_string()),
+                                allow_failover: false,
+                                reasoning_model: None,
+                                completion_model: None,
+                            },
+                        )]),
+                    },
+                ),
+                (
+                    "openrouter".to_string(),
+                    UpstreamConfig {
+                        base_url: "https://openrouter.ai/api".to_string(),
+                        api_key: None,
+                        models: BTreeMap::from([(
+                            "anthropic/claude-opus-4-7".to_string(),
+                            ModelConfig {
+                                target: Some("anthropic/claude-opus-4-7".to_string()),
+                                allow_failover: false,
+                                reasoning_model: None,
+                                completion_model: None,
+                            },
+                        )]),
+                    },
+                ),
+            ]),
+            models_list_mode: ModelsListMode::Static,
+            ..Default::default()
+        };
+
+        let models = config.static_models_list();
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].0, "openai/gpt-4.1");
+        assert_eq!(models[0].1, "gpt-4.1");
+        assert_eq!(models[1].0, "openrouter/anthropic/claude-opus-4-7");
+    }
+
+    #[test]
+    fn full_config_json_round_trip() {
+        let json = serde_json::json!({
+            "port": 8080,
+            "debug": true,
+            "models_list_mode": "static",
+            "merge_system_messages": true,
+            "upstreams": {
+                "openai": {
+                    "base_url": "https://api.openai.com",
+                    "api_key": "sk-test",
+                    "models": {
+                        "gpt-4.1": { "allow_failover": true },
+                        "o1-pro": { "target": "o1-pro" }
+                    }
+                },
+                "openrouter": {
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "api_key": "sk-or",
+                    "models": {
+                        "anthropic/claude-opus-4-7": { "target": "anthropic/claude-opus-4-7" },
+                        "openai/gpt-4.1": { "target": "openai/gpt-4.1", "allow_failover": true }
+                    }
+                }
+            }
+        });
+
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        write!(tmp, "{}", serde_json::to_string_pretty(&json).unwrap()).unwrap();
+
+        let config = Config::from_json_file(tmp.path()).unwrap();
+
+        let route = config.resolve_model("openai/gpt-4.1").unwrap();
+        assert_eq!(route.upstream_name, "openai");
+        assert_eq!(route.target, "gpt-4.1");
+        assert_eq!(route.base_url, "https://api.openai.com/v1/chat/completions");
+        assert!(route.allow_failover);
+
+        let route = config.resolve_model("o1-pro").unwrap();
+        assert_eq!(route.upstream_name, "openai");
+        assert_eq!(route.target, "o1-pro");
+
+        let route = config.resolve_model("unknown").unwrap();
+        assert!(route.is_legacy);
+
+        let models = config.static_models_list();
+        assert_eq!(models.len(), 4);
     }
 }
