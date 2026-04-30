@@ -40,12 +40,18 @@ pub async fn proxy_handler(
         );
     }
 
-    let route = config.resolve_model(&requested_model).map_err(|e| ProxyError::Config(e.to_string()))?;
+    let route = config
+        .resolve_model(&requested_model)
+        .map_err(|e| ProxyError::Config(e.to_string()))?;
 
     let policy = pipeline::TranslationPolicy {
-        reasoning_model: route.reasoning_model.clone()
+        reasoning_model: route
+            .reasoning_model
+            .clone()
             .or_else(|| config.reasoning_model.clone()),
-        completion_model: route.completion_model.clone()
+        completion_model: route
+            .completion_model
+            .clone()
             .or_else(|| config.completion_model.clone()),
         model_map: config.model_map.clone(),
         ignore_terms: config.system_prompt_ignore_terms.clone(),
@@ -72,9 +78,9 @@ pub async fn proxy_handler(
             handle_legacy_non_streaming(config, client, openai_req, start).await
         }
     } else if is_streaming {
-        handle_routed_streaming(config, client, openai_req, start, route).await
+        handle_routed_streaming(config, client, openai_req, start, route, requested_model).await
     } else {
-        handle_routed_non_streaming(config, client, openai_req, start, route).await
+        handle_routed_non_streaming(config, client, openai_req, start, route, requested_model).await
     };
 
     let status = match &result {
@@ -114,9 +120,7 @@ pub async fn list_models_handler(
             })
             .into_response())
         }
-        ModelsListMode::Upstream => {
-            list_models_from_upstream(&config, &client).await
-        }
+        ModelsListMode::Upstream => list_models_from_upstream(&config, &client).await,
         ModelsListMode::Merge => {
             let mut config_models = config.static_models_list();
             let config_ids: std::collections::HashSet<String> =
@@ -124,13 +128,10 @@ pub async fn list_models_handler(
             let config_bare_targets: std::collections::HashSet<String> =
                 config_models.iter().map(|(_, d)| d.clone()).collect();
 
-            let upstream_resp =
-                list_models_from_upstream_raw(&config, &client).await?;
+            let upstream_resp = list_models_from_upstream_raw(&config, &client).await?;
 
             for model in &upstream_resp.data {
-                if config_ids.contains(&model.id)
-                    || config_bare_targets.contains(&model.id)
-                {
+                if config_ids.contains(&model.id) || config_bare_targets.contains(&model.id) {
                     continue;
                 }
                 config_models.push((model.id.clone(), model.id.clone()));
@@ -162,10 +163,7 @@ pub async fn list_models_handler(
     }
 }
 
-async fn list_models_from_upstream(
-    config: &Config,
-    client: &Client,
-) -> ProxyResult<Response> {
+async fn list_models_from_upstream(config: &Config, client: &Client) -> ProxyResult<Response> {
     let urls = config.models_urls();
     let mut last_err = None;
 
@@ -262,13 +260,14 @@ async fn handle_routed_non_streaming(
     openai_req: openai::OpenAIRequest,
     request_start: Instant,
     route: ResolvedRoute,
+    requested_model: String,
 ) -> ProxyResult<Response> {
     let model = openai_req.model.clone();
 
     let mut urls_to_try = vec![(route.base_url.clone(), route.api_key.clone())];
 
     if route.allow_failover {
-        let failovers = config.failover_upstreams(&model, &route.upstream_name);
+        let failovers = config.failover_upstreams(&requested_model, &route.upstream_name);
         for fo in &failovers {
             urls_to_try.push((fo.base_url.clone(), fo.api_key.clone()));
         }
@@ -277,7 +276,11 @@ async fn handle_routed_non_streaming(
     let mut last_err = None;
 
     for (url, api_key) in &urls_to_try {
-        tracing::debug!("Sending non-streaming request to {} (model: {})", url, model);
+        tracing::debug!(
+            "Sending non-streaming request to {} (model: {})",
+            url,
+            model
+        );
 
         let mut req_builder = client
             .post(url)
@@ -291,7 +294,10 @@ async fn handle_routed_non_streaming(
         let upstream_start = Instant::now();
         let response = match req_builder.send().await {
             Ok(resp) => {
-                metrics::upstream_latency(upstream_start.elapsed().as_secs_f64(), "chat_completions");
+                metrics::upstream_latency(
+                    upstream_start.elapsed().as_secs_f64(),
+                    "chat_completions",
+                );
                 resp
             }
             Err(err) => {
@@ -304,26 +310,42 @@ async fn handle_routed_non_streaming(
 
         if !response.status().is_success() {
             let status = response.status();
-            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
             tracing::warn!("Upstream {} returned {}: {}", url, status, error_text);
             metrics::upstream_error("chat_completions");
 
             if is_retriable_status(status.as_u16()) {
-                last_err = Some(ProxyError::Upstream(format!("Upstream returned {}: {}", status, error_text)));
+                last_err = Some(ProxyError::Upstream(format!(
+                    "Upstream returned {}: {}",
+                    status, error_text
+                )));
                 continue;
             }
-            return Err(ProxyError::Upstream(format!("Upstream returned {}: {}", status, error_text)));
+            return Err(ProxyError::Upstream(format!(
+                "Upstream returned {}: {}",
+                status, error_text
+            )));
         }
 
         let openai_resp: openai::OpenAIResponse = response.json().await?;
         let prompt_tokens = openai_resp.usage.prompt_tokens;
         let completion_tokens = openai_resp.usage.completion_tokens;
 
-        tracing::info!(model = model.as_str(), ttfb_ms = request_start.elapsed().as_millis(), "First token received");
+        tracing::info!(
+            model = model.as_str(),
+            ttfb_ms = request_start.elapsed().as_millis(),
+            "First token received"
+        );
         metrics::tokens(prompt_tokens, completion_tokens, &model);
 
         if config.verbose {
-            tracing::trace!("Received OpenAI response: {}", serde_json::to_string_pretty(&openai_resp).unwrap_or_default());
+            tracing::trace!(
+                "Received OpenAI response: {}",
+                serde_json::to_string_pretty(&openai_resp).unwrap_or_default()
+            );
         }
 
         let anthropic_resp = pipeline::translate_response(openai_resp, &model)?;
@@ -348,13 +370,14 @@ async fn handle_routed_streaming(
     openai_req: openai::OpenAIRequest,
     request_start: Instant,
     route: ResolvedRoute,
+    requested_model: String,
 ) -> ProxyResult<Response> {
     let model = openai_req.model.clone();
 
     let mut urls_to_try = vec![(route.base_url.clone(), route.api_key.clone())];
 
     if route.allow_failover {
-        let failovers = config.failover_upstreams(&model, &route.upstream_name);
+        let failovers = config.failover_upstreams(&requested_model, &route.upstream_name);
         for fo in &failovers {
             urls_to_try.push((fo.base_url.clone(), fo.api_key.clone()));
         }
@@ -377,7 +400,10 @@ async fn handle_routed_streaming(
         let upstream_start = Instant::now();
         let response = match req_builder.send().await {
             Ok(resp) => {
-                metrics::upstream_latency(upstream_start.elapsed().as_secs_f64(), "chat_completions");
+                metrics::upstream_latency(
+                    upstream_start.elapsed().as_secs_f64(),
+                    "chat_completions",
+                );
                 resp
             }
             Err(err) => {
@@ -390,22 +416,34 @@ async fn handle_routed_streaming(
 
         if !response.status().is_success() {
             let status = response.status();
-            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
             tracing::warn!("Upstream {} returned {}: {}", url, status, error_text);
             metrics::upstream_error("chat_completions");
 
             if is_retriable_status(status.as_u16()) {
-                last_err = Some(ProxyError::Upstream(format!("Upstream returned {}: {}", status, error_text)));
+                last_err = Some(ProxyError::Upstream(format!(
+                    "Upstream returned {}: {}",
+                    status, error_text
+                )));
                 continue;
             }
-            return Err(ProxyError::Upstream(format!("Upstream returned {}: {}", status, error_text)));
+            return Err(ProxyError::Upstream(format!(
+                "Upstream returned {}: {}",
+                status, error_text
+            )));
         }
 
         let upstream = response.bytes_stream();
         let sse_stream = create_sse_stream(upstream, model.clone(), request_start);
 
         let mut headers = HeaderMap::new();
-        headers.insert("Content-Type", HeaderValue::from_static("text/event-stream"));
+        headers.insert(
+            "Content-Type",
+            HeaderValue::from_static("text/event-stream"),
+        );
         headers.insert("Cache-Control", HeaderValue::from_static("no-cache"));
         headers.insert("Connection", HeaderValue::from_static("keep-alive"));
 

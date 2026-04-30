@@ -12,7 +12,7 @@ use axum::{
 };
 use clap::Parser;
 use cli::{Cli, Command};
-use config::{Config, UpstreamConfig};
+use config::{Config, ModelsListMode, UpstreamConfig};
 use daemonize::Daemonize;
 use reqwest::Client;
 use std::collections::BTreeMap;
@@ -122,8 +122,8 @@ fn merge_env_overrides(config: &mut Config) {
     {
         config.verbose = true;
     }
-    if let Ok(key) = std::env::var("UPSTREAM_API_KEY")
-        .or_else(|_| std::env::var("OPENROUTER_API_KEY"))
+    if let Ok(key) =
+        std::env::var("UPSTREAM_API_KEY").or_else(|_| std::env::var("OPENROUTER_API_KEY"))
     {
         if !key.is_empty() {
             config.api_key = Some(key);
@@ -134,6 +134,14 @@ fn merge_env_overrides(config: &mut Config) {
     }
     if let Ok(model) = std::env::var("COMPLETION_MODEL") {
         config.completion_model = Some(model);
+    }
+    if let Ok(mode) = std::env::var("MODELS_LIST_MODE") {
+        match mode.to_lowercase().as_str() {
+            "static" => config.models_list_mode = ModelsListMode::Static,
+            "upstream" => config.models_list_mode = ModelsListMode::Upstream,
+            "merge" => config.models_list_mode = ModelsListMode::Merge,
+            _ => eprintln!("⚠️  WARNING: Invalid MODELS_LIST_MODE '{}', expected static/upstream/merge", mode),
+        }
     }
 
     let env_terms = std::env::var("ANTHROPIC_PROXY_SYSTEM_PROMPT_IGNORE_TERMS")
@@ -146,8 +154,8 @@ fn merge_env_overrides(config: &mut Config) {
     }
 
     // UPSTREAM_BASE_URL env var overrides config file upstreams entirely
-    if let Ok(raw_urls) = std::env::var("UPSTREAM_BASE_URL")
-        .or_else(|_| std::env::var("ANTHROPIC_PROXY_BASE_URL"))
+    if let Ok(raw_urls) =
+        std::env::var("UPSTREAM_BASE_URL").or_else(|_| std::env::var("ANTHROPIC_PROXY_BASE_URL"))
     {
         if let Ok(urls) = Config::parse_upstream_urls(&raw_urls) {
             config.upstream_urls = urls.clone();
@@ -155,8 +163,7 @@ fn merge_env_overrides(config: &mut Config) {
             for url in &urls {
                 let name = format!(
                     "upstream_{}",
-                    url.replace(['.', '/', ':'], "_")
-                        .trim_end_matches('_')
+                    url.replace(['.', '/', ':'], "_").trim_end_matches('_')
                 );
                 config.upstreams.insert(
                     name,
@@ -266,7 +273,12 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     if !config.upstreams.is_empty() {
         tracing::info!(
             "Configured upstreams: {}",
-            config.upstreams.keys().map(|k| k.as_str()).collect::<Vec<_>>().join(", ")
+            config
+                .upstreams
+                .keys()
+                .map(|k| k.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
         let total_models = config
             .upstreams

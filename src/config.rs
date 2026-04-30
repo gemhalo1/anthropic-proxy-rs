@@ -36,7 +36,6 @@ pub struct ModelConfig {
     pub completion_model: Option<String>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ResolvedRoute {
     pub upstream_name: String,
@@ -47,8 +46,6 @@ pub struct ResolvedRoute {
     pub reasoning_model: Option<String>,
     pub completion_model: Option<String>,
     pub is_legacy: bool,
-    pub legacy_urls: Vec<String>,
-    pub legacy_api_key: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -468,8 +465,6 @@ impl Config {
                         reasoning_model: model_conf.reasoning_model.clone(),
                         completion_model: model_conf.completion_model.clone(),
                         is_legacy: false,
-                        legacy_urls: Vec::new(),
-                        legacy_api_key: None,
                     });
                 }
             }
@@ -491,8 +486,6 @@ impl Config {
                     reasoning_model: model_conf.reasoning_model.clone(),
                     completion_model: model_conf.completion_model.clone(),
                     is_legacy: false,
-                    legacy_urls: Vec::new(),
-                    legacy_api_key: None,
                 });
             }
         }
@@ -507,8 +500,6 @@ impl Config {
             reasoning_model: None,
             completion_model: None,
             is_legacy: true,
-            legacy_urls: self.chat_completions_urls(),
-            legacy_api_key: self.api_key.clone(),
         })
     }
 
@@ -544,8 +535,6 @@ impl Config {
                             reasoning_model: model_conf.reasoning_model.clone(),
                             completion_model: model_conf.completion_model.clone(),
                             is_legacy: false,
-                            legacy_urls: Vec::new(),
-                            legacy_api_key: None,
                         });
                     }
                     break;
