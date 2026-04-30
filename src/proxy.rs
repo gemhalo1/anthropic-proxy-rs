@@ -22,9 +22,14 @@ pub async fn proxy_handler(
 ) -> ProxyResult<Response> {
     let is_streaming = req.stream.unwrap_or(false);
     let start = Instant::now();
+    let msg_count = req.messages.len();
 
-    tracing::debug!("Received request for model: {}", req.model);
-    tracing::debug!("Streaming: {}", is_streaming);
+    tracing::info!(
+        model = req.model.as_str(),
+        stream = is_streaming,
+        messages = msg_count,
+        "Received request"
+    );
     metrics::request_started(is_streaming);
 
     if config.verbose {
@@ -45,9 +50,9 @@ pub async fn proxy_handler(
     }
 
     let result = if is_streaming {
-        handle_streaming(config, client, openai_req).await
+        handle_streaming(config, client, openai_req, start).await
     } else {
-        handle_non_streaming(config, client, openai_req).await
+        handle_non_streaming(config, client, openai_req, start).await
     };
 
     let status = match &result {
@@ -128,7 +133,9 @@ async fn handle_non_streaming(
     config: Arc<Config>,
     client: Client,
     openai_req: openai::OpenAIRequest,
+    request_start: Instant,
 ) -> ProxyResult<Response> {
+    let model = openai_req.model.clone();
     let urls = config.chat_completions_urls();
     let mut last_err = None;
 
@@ -136,7 +143,7 @@ async fn handle_non_streaming(
         tracing::debug!(
             "Sending non-streaming request to {} (model: {})",
             url,
-            openai_req.model
+            model
         );
 
         let mut req_builder = client
@@ -189,11 +196,16 @@ async fn handle_non_streaming(
 
         let openai_resp: openai::OpenAIResponse = response.json().await?;
 
-        metrics::tokens(
-            openai_resp.usage.prompt_tokens,
-            openai_resp.usage.completion_tokens,
-            &openai_req.model,
+        let prompt_tokens = openai_resp.usage.prompt_tokens;
+        let completion_tokens = openai_resp.usage.completion_tokens;
+
+        tracing::info!(
+            model = model.as_str(),
+            ttfb_ms = request_start.elapsed().as_millis(),
+            "First token received"
         );
+
+        metrics::tokens(prompt_tokens, completion_tokens, &model);
 
         if config.verbose {
             tracing::trace!(
@@ -202,7 +214,15 @@ async fn handle_non_streaming(
             );
         }
 
-        let anthropic_resp = pipeline::translate_response(openai_resp, &openai_req.model)?;
+        let anthropic_resp = pipeline::translate_response(openai_resp, &model)?;
+
+        tracing::info!(
+            model = model.as_str(),
+            total_ms = request_start.elapsed().as_millis(),
+            prompt_tokens = prompt_tokens,
+            completion_tokens = completion_tokens,
+            "Request completed"
+        );
 
         if config.verbose {
             tracing::trace!(
@@ -221,7 +241,9 @@ async fn handle_streaming(
     config: Arc<Config>,
     client: Client,
     openai_req: openai::OpenAIRequest,
+    request_start: Instant,
 ) -> ProxyResult<Response> {
+    let model = openai_req.model.clone();
     let urls = config.chat_completions_urls();
     let mut last_err = None;
 
@@ -229,7 +251,7 @@ async fn handle_streaming(
         tracing::debug!(
             "Sending streaming request to {} (model: {})",
             url,
-            openai_req.model
+            model
         );
 
         let mut req_builder = client
@@ -281,7 +303,11 @@ async fn handle_streaming(
         }
 
         let upstream = response.bytes_stream();
-        let sse_stream = create_sse_stream(upstream, openai_req.model.clone());
+        let sse_stream = create_sse_stream(
+            upstream,
+            model.clone(),
+            request_start,
+        );
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -309,11 +335,13 @@ fn create_sse_stream(
     upstream: impl Stream<Item = Result<Bytes, impl std::fmt::Display + Send + 'static>>
         + Send
         + 'static,
-    fallback_model: String,
+    model: String,
+    request_start: Instant,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
         let mut buffer = String::new();
-        let mut state = stream::initial_state(fallback_model);
+        let mut state = stream::initial_state(model.clone());
+        let mut first_token_logged = false;
 
         tokio::pin!(upstream);
 
@@ -337,10 +365,30 @@ fn create_sse_stream(
                                     for event in stream::translate_done(&mut state) {
                                         yield Ok(Bytes::from(serialize_event(&event)));
                                     }
+                                    tracing::info!(
+                                        model = model.as_str(),
+                                        total_ms = request_start.elapsed().as_millis(),
+                                        "Stream completed"
+                                    );
                                     continue;
                                 }
 
                                 if let Ok(chunk) = serde_json::from_str::<openai::StreamChunk>(data) {
+                                    let has_content = chunk.choices.iter().any(|c| {
+                                        c.delta.content.as_ref().is_some_and(|s| !s.is_empty())
+                                            || c.delta.reasoning.as_ref().is_some_and(|s| !s.is_empty())
+                                            || c.delta.tool_calls.as_ref().is_some_and(|t| !t.is_empty())
+                                    });
+
+                                    if has_content && !first_token_logged {
+                                        tracing::info!(
+                                            model = model.as_str(),
+                                            ttfb_ms = request_start.elapsed().as_millis(),
+                                            "First token received"
+                                        );
+                                        first_token_logged = true;
+                                    }
+
                                     for event in stream::translate_chunk(&mut state, &chunk) {
                                         yield Ok(Bytes::from(serialize_event(&event)));
                                     }
@@ -353,6 +401,11 @@ fn create_sse_stream(
                 }
                 Err(e) => {
                     tracing::error!("Stream error: {}", e);
+                    tracing::info!(
+                        model = model.as_str(),
+                        total_ms = request_start.elapsed().as_millis(),
+                        "Stream ended with error"
+                    );
                     for event in stream::translate_error(format!("Stream error: {}", e)) {
                         yield Ok(Bytes::from(serialize_event(&event)));
                     }
@@ -370,6 +423,7 @@ mod tests {
     use futures::stream::{self, StreamExt};
     use serde_json::{json, Value};
     use std::fmt;
+    use std::time::Instant;
 
     #[derive(Debug)]
     struct TestError;
@@ -457,7 +511,7 @@ mod tests {
 
     async fn collect_events(chunks: Vec<String>, model: &str) -> Vec<Value> {
         let s = make_stream(chunks);
-        let sse = create_sse_stream(s, model.to_string());
+        let sse = create_sse_stream(s, model.to_string(), Instant::now());
         tokio::pin!(sse);
 
         let mut events = Vec::new();
@@ -622,7 +676,7 @@ mod tests {
             Err(TestError),
         ];
         let s = stream::iter(items);
-        let sse = create_sse_stream(s, "fallback".to_string());
+        let sse = create_sse_stream(s, "fallback".to_string(), Instant::now());
         tokio::pin!(sse);
 
         let mut events = Vec::new();
