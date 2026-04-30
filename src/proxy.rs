@@ -115,6 +115,7 @@ fn translation_policy(config: &Config) -> pipeline::TranslationPolicy {
         completion_model: config.completion_model.clone(),
         model_map: config.model_map.clone(),
         ignore_terms: config.system_prompt_ignore_terms.clone(),
+        merge_system_messages: config.merge_system_messages,
     }
 }
 

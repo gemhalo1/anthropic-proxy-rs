@@ -34,6 +34,10 @@ pub struct Cli {
     #[arg(long, value_name = "TEXT", value_delimiter = ';')]
     pub system_prompt_ignore: Vec<String>,
 
+    /// Merge multiple system messages into one (joined by newlines)
+    #[arg(long = "merge-system")]
+    pub merge_system_messages: bool,
+
     /// Run as background daemon
     #[arg(long)]
     pub daemon: bool,

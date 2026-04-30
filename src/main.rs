@@ -94,6 +94,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         );
         Config::dedupe_ignore_terms(&mut config.system_prompt_ignore_terms);
     }
+    if cli.merge_system_messages {
+        config.merge_system_messages = true;
+    }
 
     let log_level = if config.verbose {
         tracing::Level::TRACE

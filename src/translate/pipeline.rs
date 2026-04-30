@@ -9,6 +9,7 @@ pub struct TranslationPolicy {
     pub completion_model: Option<String>,
     pub model_map: BTreeMap<String, String>,
     pub ignore_terms: Vec<String>,
+    pub merge_system_messages: bool,
 }
 
 pub fn translate_request(
@@ -47,6 +48,35 @@ pub fn translate_request(
                     });
                 }
             }
+        }
+    }
+
+    // Merge multiple system messages if requested
+    if policy.merge_system_messages && openai_messages.iter().filter(|m| m.role == "system").count() > 1 {
+        let mut system_texts = Vec::new();
+        let mut other_messages = Vec::new();
+
+        for msg in openai_messages {
+            if msg.role == "system" {
+                if let Some(openai::MessageContent::Text(text)) = msg.content {
+                    system_texts.push(text);
+                }
+            } else {
+                other_messages.push(msg);
+            }
+        }
+
+        if !system_texts.is_empty() {
+            openai_messages = vec![openai::Message {
+                role: "system".to_string(),
+                content: Some(openai::MessageContent::Text(system_texts.join("\n"))),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            }];
+            openai_messages.extend(other_messages);
+        } else {
+            openai_messages = other_messages;
         }
     }
 
@@ -221,6 +251,7 @@ mod tests {
             completion_model: config.completion_model.clone(),
             model_map: config.model_map.clone(),
             ignore_terms: config.system_prompt_ignore_terms.clone(),
+            merge_system_messages: config.merge_system_messages,
         }
     }
 
@@ -688,5 +719,158 @@ mod tests {
         let result = translate_models_list(response);
         assert!(result.data.is_empty());
         assert!(result.first_id.is_none());
+    }
+
+    #[test]
+    fn merges_multiple_system_messages_when_enabled() {
+        let req = anthropic::AnthropicRequest {
+            model: "claude-3-opus".to_string(),
+            messages: vec![anthropic::Message {
+                role: "user".to_string(),
+                content: anthropic::MessageContent::Text("hello".to_string()),
+            }],
+            max_tokens: 100,
+            system: Some(anthropic::SystemPrompt::Multiple(vec![
+                anthropic::SystemMessage {
+                    message_type: "text".to_string(),
+                    text: "System prompt 1".to_string(),
+                    cache_control: None,
+                },
+                anthropic::SystemMessage {
+                    message_type: "text".to_string(),
+                    text: "System prompt 2".to_string(),
+                    cache_control: None,
+                },
+            ])),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: None,
+            tools: None,
+            metadata: None,
+            extra: json!({}),
+        };
+
+        let mut policy = default_policy();
+        policy.merge_system_messages = true;
+
+        let openai = translate_request(req, &policy).unwrap();
+
+        // Should have 2 messages: 1 system (merged) + 1 user
+        assert_eq!(openai.messages.len(), 2);
+        
+        // First should be merged system message
+        assert_eq!(openai.messages[0].role, "system");
+        match &openai.messages[0].content {
+            Some(openai::MessageContent::Text(text)) => {
+                assert_eq!(text, "System prompt 1\nSystem prompt 2");
+            }
+            _ => panic!("expected text content in system message"),
+        }
+
+        // Second should be user message
+        assert_eq!(openai.messages[1].role, "user");
+    }
+
+    #[test]
+    fn keeps_multiple_system_messages_when_disabled() {
+        let req = anthropic::AnthropicRequest {
+            model: "claude-3-opus".to_string(),
+            messages: vec![anthropic::Message {
+                role: "user".to_string(),
+                content: anthropic::MessageContent::Text("hello".to_string()),
+            }],
+            max_tokens: 100,
+            system: Some(anthropic::SystemPrompt::Multiple(vec![
+                anthropic::SystemMessage {
+                    message_type: "text".to_string(),
+                    text: "System prompt 1".to_string(),
+                    cache_control: None,
+                },
+                anthropic::SystemMessage {
+                    message_type: "text".to_string(),
+                    text: "System prompt 2".to_string(),
+                    cache_control: None,
+                },
+            ])),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: None,
+            tools: None,
+            metadata: None,
+            extra: json!({}),
+        };
+
+        let policy = default_policy();
+        // merge_system_messages is false by default
+
+        let openai = translate_request(req, &policy).unwrap();
+
+        // Should have 3 messages: 2 system + 1 user
+        assert_eq!(openai.messages.len(), 3);
+        
+        // First two should be separate system messages
+        assert_eq!(openai.messages[0].role, "system");
+        match &openai.messages[0].content {
+            Some(openai::MessageContent::Text(text)) => {
+                assert_eq!(text, "System prompt 1");
+            }
+            _ => panic!("expected text content in first system message"),
+        }
+
+        assert_eq!(openai.messages[1].role, "system");
+        match &openai.messages[1].content {
+            Some(openai::MessageContent::Text(text)) => {
+                assert_eq!(text, "System prompt 2");
+            }
+            _ => panic!("expected text content in second system message"),
+        }
+
+        // Third should be user message
+        assert_eq!(openai.messages[2].role, "user");
+    }
+
+    #[test]
+    fn single_system_message_unchanged_by_merge() {
+        let req = anthropic::AnthropicRequest {
+            model: "claude-3-opus".to_string(),
+            messages: vec![anthropic::Message {
+                role: "user".to_string(),
+                content: anthropic::MessageContent::Text("hello".to_string()),
+            }],
+            max_tokens: 100,
+            system: Some(anthropic::SystemPrompt::Single("System prompt".to_string())),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: None,
+            tools: None,
+            metadata: None,
+            extra: json!({}),
+        };
+
+        let mut policy = default_policy();
+        policy.merge_system_messages = true;
+
+        let openai = translate_request(req, &policy).unwrap();
+
+        // Should have 2 messages: 1 system + 1 user
+        assert_eq!(openai.messages.len(), 2);
+        
+        // First should be system message (unchanged)
+        assert_eq!(openai.messages[0].role, "system");
+        match &openai.messages[0].content {
+            Some(openai::MessageContent::Text(text)) => {
+                assert_eq!(text, "System prompt");
+            }
+            _ => panic!("expected text content in system message"),
+        }
+
+        // Second should be user message
+        assert_eq!(openai.messages[1].role, "user");
     }
 }

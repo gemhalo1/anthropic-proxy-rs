@@ -11,6 +11,7 @@ pub struct Config {
     pub system_prompt_ignore_terms: Vec<String>,
     pub reasoning_model: Option<String>,
     pub completion_model: Option<String>,
+    pub merge_system_messages: bool,
     pub debug: bool,
     pub verbose: bool,
 }
@@ -25,6 +26,7 @@ impl Default for Config {
             system_prompt_ignore_terms: Vec::new(),
             reasoning_model: None,
             completion_model: None,
+            merge_system_messages: false,
             debug: false,
             verbose: false,
         }
@@ -130,6 +132,7 @@ impl Config {
             system_prompt_ignore_terms,
             reasoning_model,
             completion_model,
+            merge_system_messages: false,
             debug,
             verbose,
         })
