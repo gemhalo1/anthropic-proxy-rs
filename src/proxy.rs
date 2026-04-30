@@ -120,7 +120,29 @@ pub async fn list_models_handler(
             })
             .into_response())
         }
-        ModelsListMode::Upstream => list_models_from_upstream(&config, &client).await,
+        ModelsListMode::Upstream => {
+            let models = fetch_all_upstream_models(&config, &client).await?;
+            let data: Vec<anthropic::ModelInfo> = models
+                .into_iter()
+                .map(|(id, display_name)| anthropic::ModelInfo {
+                    id,
+                    display_name,
+                    created_at: "1970-01-01T00:00:00Z".to_string(),
+                    model_type: "model".to_string(),
+                })
+                .collect();
+
+            let first_id = data.first().map(|m| m.id.clone());
+            let last_id = data.last().map(|m| m.id.clone());
+
+            Ok(Json(anthropic::ModelsListResponse {
+                data,
+                first_id,
+                has_more: false,
+                last_id,
+            })
+            .into_response())
+        }
         ModelsListMode::Merge => {
             let mut config_models = config.static_models_list();
             let config_ids: std::collections::HashSet<String> =
@@ -128,13 +150,13 @@ pub async fn list_models_handler(
             let config_bare_targets: std::collections::HashSet<String> =
                 config_models.iter().map(|(_, d)| d.clone()).collect();
 
-            let upstream_resp = list_models_from_upstream_raw(&config, &client).await?;
+            let upstream_models = fetch_all_upstream_models(&config, &client).await?;
 
-            for model in &upstream_resp.data {
-                if config_ids.contains(&model.id) || config_bare_targets.contains(&model.id) {
+            for (id, display_name) in upstream_models {
+                if config_ids.contains(&id) || config_bare_targets.contains(&id) {
                     continue;
                 }
-                config_models.push((model.id.clone(), model.id.clone()));
+                config_models.push((id, display_name));
             }
 
             config_models.sort_by(|a, b| a.0.cmp(&b.0));
@@ -163,91 +185,67 @@ pub async fn list_models_handler(
     }
 }
 
-async fn list_models_from_upstream(config: &Config, client: &Client) -> ProxyResult<Response> {
-    let urls = config.models_urls();
-    let mut last_err = None;
-
-    for url in &urls {
-        tracing::debug!("Fetching models from {}", url);
-
-        let mut req_builder = client.get(url).timeout(Duration::from_secs(60));
-        if let Some(api_key) = &config.api_key {
-            req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key));
-        }
-
-        match req_builder.send().await {
-            Ok(response) if response.status().is_success() => {
-                let openai_resp: openai::ModelsListResponse = response.json().await?;
-                let anthropic_resp = pipeline::translate_models_list(openai_resp);
-                return Ok(Json(anthropic_resp).into_response());
-            }
-            Ok(response) => {
-                let status = response.status();
-                let error_text = response
-                    .text()
-                    .await
-                    .unwrap_or_else(|_| "Unknown error".to_string());
-                tracing::warn!("Upstream {} returned {}: {}", url, status, error_text);
-                if is_retriable_status(status.as_u16()) {
-                    last_err = Some(format!("Upstream returned {}: {}", status, error_text));
-                    continue;
-                }
-                return Err(ProxyError::Upstream(format!(
-                    "Upstream returned {}: {}",
-                    status, error_text
-                )));
-            }
-            Err(err) => {
-                tracing::warn!("Failed to reach {}: {:?}", url, err);
-                last_err = Some(format!("HTTP error: {}", err));
-                continue;
-            }
-        }
-    }
-
-    Err(ProxyError::Upstream(
-        last_err.unwrap_or_else(|| "All upstreams failed".to_string()),
-    ))
-}
-
-async fn list_models_from_upstream_raw(
+async fn fetch_all_upstream_models(
     config: &Config,
     client: &Client,
-) -> ProxyResult<openai::ModelsListResponse> {
-    let urls = config.models_urls();
-    let mut last_err = None;
+) -> ProxyResult<Vec<(String, String)>> {
+    let mut all_models = Vec::new();
+    let mut seen_ids = std::collections::HashSet::new();
+    let mut any_success = false;
+    let mut last_err: Option<String> = None;
 
-    for url in &urls {
-        let mut req_builder = client.get(url).timeout(Duration::from_secs(60));
-        if let Some(api_key) = &config.api_key {
-            req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key));
+    for (upstream_name, upstream) in &config.upstreams {
+        let models_url = crate::config::Config::resolve_models_url(&upstream.base_url)
+            .map_err(|e| ProxyError::Config(e.to_string()))?;
+
+        tracing::debug!("Fetching models from {} ({})", models_url, upstream_name);
+
+        let mut req_builder = client.get(&models_url).timeout(Duration::from_secs(60));
+        let api_key = upstream
+            .api_key
+            .clone()
+            .or_else(|| config.api_key.clone());
+        if let Some(key) = &api_key {
+            req_builder = req_builder.header("Authorization", format!("Bearer {}", key));
         }
 
         match req_builder.send().await {
             Ok(response) if response.status().is_success() => {
-                return Ok(response.json().await?);
+                let resp: openai::ModelsListResponse = response.json().await?;
+                for model in resp.data {
+                    let namespaced_id = format!("{}/{}", upstream_name, model.id);
+                    if !seen_ids.contains(&namespaced_id) {
+                        seen_ids.insert(namespaced_id.clone());
+                        all_models.push((namespaced_id, model.id.clone()));
+                    }
+                }
+                any_success = true;
             }
             Ok(response) => {
                 let status = response.status();
-                if is_retriable_status(status.as_u16()) {
-                    last_err = Some(format!("Upstream returned {}", status));
-                    continue;
-                }
-                return Err(ProxyError::Upstream(format!(
-                    "Upstream returned {}",
+                tracing::warn!(
+                    "Upstream {} ({}) returned {}: skipping",
+                    upstream_name,
+                    models_url,
                     status
-                )));
+                );
+                last_err = Some(format!("{} returned {}", upstream_name, status));
             }
             Err(err) => {
-                last_err = Some(format!("HTTP error: {}", err));
-                continue;
+                tracing::warn!("Failed to reach {} ({:?}): skipping", models_url, err);
+                last_err = Some(format!("{}: {}", upstream_name, err));
             }
         }
     }
 
-    Err(ProxyError::Upstream(
-        last_err.unwrap_or_else(|| "All upstreams failed".to_string()),
-    ))
+    if let Some(err) = last_err {
+        if !any_success {
+            return Err(ProxyError::Upstream(err));
+        }
+    }
+
+    all_models.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(all_models)
 }
 
 fn is_retriable_status(status: u16) -> bool {

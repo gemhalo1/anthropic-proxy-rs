@@ -1,0 +1,61 @@
+{
+  "port": 3000,
+  "debug": false,
+  "verbose": false,
+  "merge_system_messages": false,
+  "merge_user_messages": false,
+  "models_list_mode": "static",
+  "system_prompt_ignore_terms": ["x-anthropic-billing-header:"],
+  "upstreams": {
+    "openrouter": {
+      "base_url": "https://openrouter.ai/api",
+      "api_key": "sk-or-v1-...",
+      "models": {
+        "claude-sonnet-4-20250514": {
+          "target": "anthropic/claude-sonnet-4-20250514",
+          "allow_failover": true
+        },
+        "gpt-4.1": {
+          "target": "openai/gpt-4.1"
+        },
+        "gpt-4.1-mini": {
+          "target": "openai/gpt-4.1-mini",
+          "allow_failover": true,
+          "completion_model": "openai/gpt-4.1-mini"
+        },
+        "o3": {
+          "target": "openai/o3",
+          "reasoning_model": "openai/o3"
+        }
+      }
+    },
+    "openai": {
+      "base_url": "https://api.openai.com",
+      "api_key": "sk-...",
+      "models": {
+        "gpt-4.1": {},
+        "gpt-4.1-mini": {},
+        "gpt-4.1-nano": {},
+        "o3": {
+          "reasoning_model": "o3"
+        },
+        "o4-mini": {
+          "reasoning_model": "o4-mini",
+          "allow_failover": true
+        }
+      }
+    },
+    "ollama": {
+      "base_url": "http://localhost:11434",
+      "models": {
+        "qwen3:32b": {
+          "target": "qwen3:32b"
+        },
+        "devstral": {
+          "target": "devstral",
+          "allow_failover": true
+        }
+      }
+    }
+  }
+}

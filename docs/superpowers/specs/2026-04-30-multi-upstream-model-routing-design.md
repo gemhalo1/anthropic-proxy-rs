@@ -36,10 +36,10 @@ Priority: CLI args > env vars > config file > defaults.
       "base_url": "https://openrouter.ai/api",
       "api_key": "sk-or-...",
       "models": {
-        "openrouter/anthropic/claude-opus-4-7": {
+        "anthropic/claude-opus-4-7": {
           "target": "anthropic/claude-opus-4-7"
         },
-        "openrouter/openai/gpt-4.1": {
+        "openai/gpt-4.1": {
           "target": "openai/gpt-4.1",
           "allow_failover": true,
           "reasoning_model": "anthropic/claude-opus-4-7",
@@ -51,11 +51,11 @@ Priority: CLI args > env vars > config file > defaults.
       "base_url": "https://api.openai.com",
       "api_key": "sk-...",
       "models": {
-        "openai/gpt-4.1": {
+        "gpt-4.1": {
           "target": "gpt-4.1",
           "allow_failover": true
         },
-        "openai/o1-pro": {
+        "o1-pro": {
           "target": "o1-pro"
         }
       }
@@ -71,13 +71,14 @@ Priority: CLI args > env vars > config file > defaults.
 - `models_list_mode`: `static` (default), `upstream`, `merge` — controls `/v1/models` behavior
 
 **Upstream entry** (`upstreams.<name>`):
-- `base_url`: required. Same validation as current `UPSTREAM_BASE_URL`
+- `base_url`: required. Goes through the same URL resolution logic as current `UPSTREAM_BASE_URL` — the proxy auto-appends `/v1/chat/completions` if no version segment is detected (e.g., `https://api.openai.com` → `https://api.openai.com/v1/chat/completions`), but preserves an explicit version segment (e.g., `https://openrouter.ai/api/v1` → `https://openrouter.ai/api/v1/chat/completions`, not `/v1/v1/chat/completions`). Full endpoint paths like `.../chat/completions` are also accepted as-is.
 - `api_key`: optional. If omitted, uses top-level `UPSTREAM_API_KEY` env var or no auth
 - `models`: required. Map of model ID to model config
 
-**Model entry** (`models.<id>`):
-- Model ID format: `<upstream_name>/<original_model_id>`. Example: `openai/gpt-4.1`
-- `target`: required. The actual model name sent to the upstream. Example: `gpt-4.1` (without prefix)
+**Model entry** (`models.<bare_name>`):
+- Model key uses bare model name (no upstream prefix). Example: `gpt-4.1` under `openai` upstream
+- The namespaced ID (`openai/gpt-4.1`) is computed at runtime by combining upstream name + bare model key
+- `target`: optional. The actual model name sent to the upstream. If omitted or null, defaults to the bare model key. Example: `gpt-4.1` key with no `target` → sends `gpt-4.1` upstream; `anthropic/claude-opus-4-7` key with `target: "claude-opus-4-7"` → sends `claude-opus-4-7` upstream
 - `allow_failover`: optional, default `false`. If `true`, when this upstream fails (429/5xx), try other upstreams that have a model with the same `target`
 - `reasoning_model`: optional. Per-model override for thinking/reasoning mode
 - `completion_model`: optional. Per-model override for non-thinking mode
@@ -88,9 +89,9 @@ Priority: CLI args > env vars > config file > defaults.
 
 Given the requested `model` string from the client:
 
-1. **Prefix match**: Split on first `/`. If the prefix matches a configured upstream name (e.g., `openai` in `openai/gpt-4.1`), route to that upstream with `target` as the model name sent upstream.
+1. **Prefix match**: Split on first `/`. If the prefix matches a configured upstream name (e.g., `openai` in `openai/gpt-4.1`), look up the remainder (`gpt-4.1`) as a bare model key in that upstream's `models` map. Route to that upstream with `target` as the model name sent upstream.
 
-2. **Bare name match**: If the prefix is not a known upstream (e.g., `gpt-4.1` or `claude-opus-4-6`), iterate all upstreams in config order. Find the first model entry where `target` equals the requested model name. Route to that upstream.
+2. **Bare name match**: If the prefix is not a known upstream (e.g., `gpt-4.1` or `claude-opus-4-6`), iterate all upstreams in alphabetical order (BTreeMap iteration). Find the first model entry where the bare model key equals the requested model name. Route to that upstream.
 
 3. **No match found**: If neither prefix nor bare name matches any configured model, fall back to legacy behavior — send the original model name to all configured upstream URLs with current failover logic.
 
@@ -98,7 +99,7 @@ Given the requested `model` string from the client:
 
 - When a model routes to a specific upstream and that upstream returns 429/5xx:
   - If `allow_failover: false` (default): return the error to the client immediately
-  - If `allow_failover: true`: iterate other upstreams that have a model with the same `target`, in config order, and try each one
+  - If `allow_failover: true`: iterate other upstreams (in alphabetical order) that have a model with the same bare model key or the same `target`, and try each one
 - Bare name matches: same `allow_failover` rules apply using the matched model entry's config
 
 ### Step 3: Model name substitution

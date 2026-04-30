@@ -203,6 +203,7 @@ impl Config {
             .collect()
     }
 
+    #[allow(dead_code)]
     pub fn models_urls(&self) -> Vec<String> {
         self.upstream_urls
             .iter()
@@ -253,7 +254,7 @@ impl Config {
         Ok(format!("{}/v1/chat/completions", normalized))
     }
 
-    fn resolve_models_url(base_url: &str) -> Result<String> {
+    pub fn resolve_models_url(base_url: &str) -> Result<String> {
         let (normalized, path_segments) = Self::parse_base_url(base_url)?;
 
         if Self::is_chat_completions_path(&path_segments) {
@@ -467,6 +468,24 @@ impl Config {
                         is_legacy: false,
                     });
                 }
+
+                // Upstream found but model not in models map — if models map is empty,
+                // treat as "accepts any model" and use bare name as target
+                if upstream.models.is_empty() {
+                    let chat_url = Self::resolve_chat_completions_url(&upstream.base_url)?;
+                    let api_key = upstream.api_key.clone().or_else(|| self.api_key.clone());
+
+                    return Ok(ResolvedRoute {
+                        upstream_name: prefix.to_string(),
+                        target: remainder.to_string(),
+                        base_url: chat_url,
+                        api_key,
+                        allow_failover: false,
+                        reasoning_model: None,
+                        completion_model: None,
+                        is_legacy: false,
+                    });
+                }
             }
         }
 
@@ -485,6 +504,23 @@ impl Config {
                     allow_failover: model_conf.allow_failover,
                     reasoning_model: model_conf.reasoning_model.clone(),
                     completion_model: model_conf.completion_model.clone(),
+                    is_legacy: false,
+                });
+            }
+
+            // Upstream with empty models map accepts any bare model name
+            if upstream.models.is_empty() {
+                let chat_url = Self::resolve_chat_completions_url(&upstream.base_url)?;
+                let api_key = upstream.api_key.clone().or_else(|| self.api_key.clone());
+
+                return Ok(ResolvedRoute {
+                    upstream_name: upstream_name.clone(),
+                    target: model.to_string(),
+                    base_url: chat_url,
+                    api_key,
+                    allow_failover: false,
+                    reasoning_model: None,
+                    completion_model: None,
                     is_legacy: false,
                 });
             }

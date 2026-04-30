@@ -24,7 +24,11 @@ pub fn translate_request(
     if let Some(system) = req.system {
         match system {
             anthropic::SystemPrompt::Single(text) => {
-                if !text.trim().to_ascii_lowercase().starts_with("x-anthropic-billing-header:") {
+                if !text
+                    .trim()
+                    .to_ascii_lowercase()
+                    .starts_with("x-anthropic-billing-header:")
+                {
                     openai_messages.push(openai::Message {
                         role: "system".to_string(),
                         content: Some(openai::MessageContent::Text(sanitize_prompt(
@@ -39,7 +43,12 @@ pub fn translate_request(
             }
             anthropic::SystemPrompt::Multiple(messages) => {
                 for msg in messages {
-                    if msg.text.trim().to_ascii_lowercase().starts_with("x-anthropic-billing-header:") {
+                    if msg
+                        .text
+                        .trim()
+                        .to_ascii_lowercase()
+                        .starts_with("x-anthropic-billing-header:")
+                    {
                         continue;
                     }
                     openai_messages.push(openai::Message {
@@ -58,7 +67,13 @@ pub fn translate_request(
     }
 
     // Merge multiple system messages if requested
-    if policy.merge_system_messages && openai_messages.iter().filter(|m| m.role == "system").count() > 1 {
+    if policy.merge_system_messages
+        && openai_messages
+            .iter()
+            .filter(|m| m.role == "system")
+            .count()
+            > 1
+    {
         let mut system_texts = Vec::new();
         let mut other_messages = Vec::new();
 
@@ -181,6 +196,7 @@ pub fn translate_response(
     })
 }
 
+#[allow(dead_code)]
 pub fn translate_models_list(resp: openai::ModelsListResponse) -> anthropic::ModelsListResponse {
     let data: Vec<_> = resp
         .data
@@ -807,7 +823,7 @@ mod tests {
 
         // Should have 2 messages: 1 system (merged) + 1 user
         assert_eq!(openai.messages.len(), 2);
-        
+
         // First should be merged system message
         assert_eq!(openai.messages[0].role, "system");
         match &openai.messages[0].content {
@@ -859,7 +875,7 @@ mod tests {
 
         // Should have 3 messages: 2 system + 1 user
         assert_eq!(openai.messages.len(), 3);
-        
+
         // First two should be separate system messages
         assert_eq!(openai.messages[0].role, "system");
         match &openai.messages[0].content {
@@ -908,7 +924,7 @@ mod tests {
 
         // Should have 2 messages: 1 system + 1 user
         assert_eq!(openai.messages.len(), 2);
-        
+
         // First should be system message (unchanged)
         assert_eq!(openai.messages[0].role, "system");
         match &openai.messages[0].content {
@@ -945,7 +961,11 @@ mod tests {
         };
 
         let openai = translate_request(req, &default_policy()).unwrap();
-        let system_msgs: Vec<_> = openai.messages.iter().filter(|m| m.role == "system").collect();
+        let system_msgs: Vec<_> = openai
+            .messages
+            .iter()
+            .filter(|m| m.role == "system")
+            .collect();
         assert!(system_msgs.is_empty(), "billing header should be dropped");
     }
 
@@ -981,7 +1001,11 @@ mod tests {
         };
 
         let openai = translate_request(req, &default_policy()).unwrap();
-        let system_msgs: Vec<_> = openai.messages.iter().filter(|m| m.role == "system").collect();
+        let system_msgs: Vec<_> = openai
+            .messages
+            .iter()
+            .filter(|m| m.role == "system")
+            .collect();
         assert_eq!(system_msgs.len(), 1);
         match &system_msgs[0].content {
             Some(openai::MessageContent::Text(text)) => {
@@ -1012,7 +1036,11 @@ mod tests {
         };
 
         let openai = translate_request(req, &default_policy()).unwrap();
-        let system_msgs: Vec<_> = openai.messages.iter().filter(|m| m.role == "system").collect();
+        let system_msgs: Vec<_> = openai
+            .messages
+            .iter()
+            .filter(|m| m.role == "system")
+            .collect();
         assert_eq!(system_msgs.len(), 1);
     }
 
