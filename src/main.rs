@@ -309,6 +309,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/v1/messages", post(proxy::proxy_handler))
+        .route("/v1/chat/completions", post(proxy::chat_completions_handler))
         .route("/v1/models", get(proxy::list_models_handler))
         .route("/health", axum::routing::get(health_handler))
         .route(

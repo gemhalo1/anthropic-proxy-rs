@@ -750,6 +750,511 @@ async fn handle_legacy_streaming(
     Err(last_err.unwrap_or_else(|| ProxyError::Upstream("All upstreams failed".to_string())))
 }
 
+/// Passthrough handler for OpenAI-compatible `/v1/chat/completions` endpoint.
+/// Receives OpenAI-format request, forwards unchanged to upstream, returns OpenAI-format response.
+pub async fn chat_completions_handler(
+    Extension(config): Extension<Arc<Config>>,
+    Extension(client): Extension<Client>,
+    headers: HeaderMap,
+    Json(req): Json<openai::OpenAIRequest>,
+) -> ProxyResult<Response> {
+    let is_streaming = req.stream.unwrap_or(false);
+    let start = Instant::now();
+    let requested_model = req.model.clone();
+
+    let client_headers = ClientHeaders::from_map(&headers);
+    let log_prefix = client_headers.log_prefix().unwrap_or("unknown");
+
+    tracing::info!(
+        model = requested_model.as_str(),
+        stream = is_streaming,
+        client = log_prefix,
+        "Received OpenAI passthrough request"
+    );
+    metrics::request_started(is_streaming);
+
+    if config.verbose {
+        tracing::trace!(
+            "Incoming OpenAI request: {}",
+            serde_json::to_string_pretty(&req).unwrap_or_default()
+        );
+    }
+
+    let route = config
+        .resolve_model(&requested_model)
+        .map_err(|e| ProxyError::Config(e.to_string()))?;
+
+    let mut req_with_target = req;
+    req_with_target.model = route.target.clone();
+
+    let result = if route.is_legacy {
+        if is_streaming {
+            handle_passthrough_legacy_streaming(config, client, req_with_target, start, &client_headers).await
+        } else {
+            handle_passthrough_legacy_non_streaming(config, client, req_with_target, start, &client_headers).await
+        }
+    } else if is_streaming {
+        handle_passthrough_routed_streaming(client, req_with_target, start, &route, &client_headers).await
+    } else {
+        handle_passthrough_routed_non_streaming(client, req_with_target, start, &route, &client_headers).await
+    };
+
+    let status = match &result {
+        Ok(resp) => resp.status().as_u16(),
+        Err(_) => 500,
+    };
+    metrics::request_finished(start, status, is_streaming);
+
+    result
+}
+
+async fn handle_passthrough_routed_non_streaming(
+    client: Client,
+    openai_req: openai::OpenAIRequest,
+    request_start: Instant,
+    route: &ResolvedRoute,
+    client_headers: &ClientHeaders,
+) -> ProxyResult<Response> {
+    let model = openai_req.model.clone();
+
+    let prefix = client_headers
+        .log_prefix()
+        .map(|p| format!("[{}] ", p))
+        .unwrap_or_default();
+    tracing::debug!(
+        "{}Sending passthrough non-streaming request to {} (model: {})",
+        prefix,
+        route.base_url,
+        model
+    );
+
+    let mut req_builder = client
+        .post(&route.base_url)
+        .json(&openai_req)
+        .timeout(Duration::from_secs(300));
+
+    req_builder = client_headers.apply_to_request(req_builder);
+
+    if let Some(key) = &route.api_key {
+        req_builder = req_builder.header("Authorization", format!("Bearer {}", key));
+    }
+
+    let upstream_start = Instant::now();
+    let response = match req_builder.send().await {
+        Ok(resp) => {
+            metrics::upstream_latency(upstream_start.elapsed().as_secs_f64(), "chat_completions");
+            resp
+        }
+        Err(err) => {
+            tracing::warn!("Failed to reach {}: {:?}", route.base_url, err);
+            metrics::upstream_error("chat_completions");
+            return Err(ProxyError::Http(err));
+        }
+    };
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let error_text = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Unknown error".to_string());
+        tracing::warn!(
+            "Passthrough upstream {} returned {}: {}",
+            route.base_url,
+            status,
+            error_text
+        );
+        metrics::upstream_error("chat_completions");
+        return Err(ProxyError::Upstream(format!(
+            "Upstream returned {}: {}",
+            status, error_text
+        )));
+    }
+
+    let openai_resp: openai::OpenAIResponse = response.json().await?;
+    let prompt_tokens = openai_resp.usage.prompt_tokens;
+    let completion_tokens = openai_resp.usage.completion_tokens;
+    let cached_tokens = openai_resp
+        .usage
+        .prompt_tokens_details
+        .as_ref()
+        .and_then(|d| d.cached_tokens)
+        .unwrap_or(0);
+
+    tracing::info!(
+        model = model.as_str(),
+        ttfb_ms = request_start.elapsed().as_millis(),
+        "First token received"
+    );
+    metrics::tokens(prompt_tokens, completion_tokens, &model);
+
+    tracing::info!(
+        model = model.as_str(),
+        total_ms = request_start.elapsed().as_millis(),
+        prompt_tokens = prompt_tokens,
+        completion_tokens = completion_tokens,
+        cached_tokens = cached_tokens,
+        "Passthrough request completed"
+    );
+
+    Ok(Json(openai_resp).into_response())
+}
+
+async fn handle_passthrough_routed_streaming(
+    client: Client,
+    openai_req: openai::OpenAIRequest,
+    request_start: Instant,
+    route: &ResolvedRoute,
+    client_headers: &ClientHeaders,
+) -> ProxyResult<Response> {
+    let model = openai_req.model.clone();
+
+    let prefix = client_headers
+        .log_prefix()
+        .map(|p| format!("[{}] ", p))
+        .unwrap_or_default();
+    tracing::debug!(
+        "{}Sending passthrough streaming request to {} (model: {})",
+        prefix,
+        route.base_url,
+        model
+    );
+
+    let mut req_builder = client
+        .post(&route.base_url)
+        .json(&openai_req)
+        .timeout(Duration::from_secs(300));
+
+    req_builder = client_headers.apply_to_request(req_builder);
+
+    if let Some(key) = &route.api_key {
+        req_builder = req_builder.header("Authorization", format!("Bearer {}", key));
+    }
+
+    let upstream_start = Instant::now();
+    let response = match req_builder.send().await {
+        Ok(resp) => {
+            metrics::upstream_latency(upstream_start.elapsed().as_secs_f64(), "chat_completions");
+            resp
+        }
+        Err(err) => {
+            tracing::warn!("Failed to reach {}: {:?}", route.base_url, err);
+            metrics::upstream_error("chat_completions");
+            return Err(ProxyError::Http(err));
+        }
+    };
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let error_text = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Unknown error".to_string());
+        tracing::warn!(
+            "Passthrough upstream {} returned {}: {}",
+            route.base_url,
+            status,
+            error_text
+        );
+        metrics::upstream_error("chat_completions");
+        return Err(ProxyError::Upstream(format!(
+            "Upstream returned {}: {}",
+            status, error_text
+        )));
+    }
+
+    tracing::info!(
+        model = model.as_str(),
+        ttfb_ms = request_start.elapsed().as_millis(),
+        "First token received (passthrough stream)"
+    );
+
+    let upstream = response.bytes_stream();
+    let sse_stream = create_passthrough_sse_stream(upstream, model.clone(), request_start);
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "Content-Type",
+        HeaderValue::from_static("text/event-stream"),
+    );
+    headers.insert("Cache-Control", HeaderValue::from_static("no-cache"));
+    headers.insert("Connection", HeaderValue::from_static("keep-alive"));
+
+    Ok((headers, Body::from_stream(sse_stream)).into_response())
+}
+
+async fn handle_passthrough_legacy_non_streaming(
+    config: Arc<Config>,
+    client: Client,
+    openai_req: openai::OpenAIRequest,
+    request_start: Instant,
+    client_headers: &ClientHeaders,
+) -> ProxyResult<Response> {
+    let model = openai_req.model.clone();
+    let urls = config.chat_completions_urls();
+    let mut last_err = None;
+
+    for url in &urls {
+        let prefix = client_headers
+            .log_prefix()
+            .map(|p| format!("[{}] ", p))
+            .unwrap_or_default();
+        tracing::debug!(
+            "{}Sending passthrough legacy non-streaming request to {} (model: {})",
+            prefix,
+            url,
+            model
+        );
+
+        let mut req_builder = client
+            .post(url)
+            .json(&openai_req)
+            .timeout(Duration::from_secs(300));
+
+        req_builder = client_headers.apply_to_request(req_builder);
+
+        if let Some(api_key) = &config.api_key {
+            req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key));
+        }
+
+        let upstream_start = Instant::now();
+        let response = match req_builder.send().await {
+            Ok(resp) => {
+                metrics::upstream_latency(upstream_start.elapsed().as_secs_f64(), "chat_completions");
+                resp
+            }
+            Err(err) => {
+                tracing::warn!("Failed to reach {}: {:?}", url, err);
+                metrics::upstream_error("chat_completions");
+                last_err = Some(ProxyError::Http(err));
+                continue;
+            }
+        };
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            tracing::warn!("Passthrough legacy upstream {} returned {}: {}", url, status, error_text);
+            metrics::upstream_error("chat_completions");
+
+            if is_retriable_status(status.as_u16()) {
+                last_err = Some(ProxyError::Upstream(format!(
+                    "Upstream returned {}: {}",
+                    status, error_text
+                )));
+                continue;
+            }
+            return Err(ProxyError::Upstream(format!(
+                "Upstream returned {}: {}",
+                status, error_text
+            )));
+        }
+
+        let openai_resp: openai::OpenAIResponse = response.json().await?;
+        let prompt_tokens = openai_resp.usage.prompt_tokens;
+        let completion_tokens = openai_resp.usage.completion_tokens;
+        let cached_tokens = openai_resp
+            .usage
+            .prompt_tokens_details
+            .as_ref()
+            .and_then(|d| d.cached_tokens)
+            .unwrap_or(0);
+
+        tracing::info!(model = model.as_str(), ttfb_ms = request_start.elapsed().as_millis(), "First token received");
+        metrics::tokens(prompt_tokens, completion_tokens, &model);
+
+        tracing::info!(
+            model = model.as_str(),
+            total_ms = request_start.elapsed().as_millis(),
+            prompt_tokens = prompt_tokens,
+            completion_tokens = completion_tokens,
+            cached_tokens = cached_tokens,
+            "Passthrough legacy request completed"
+        );
+
+        return Ok(Json(openai_resp).into_response());
+    }
+
+    Err(last_err.unwrap_or_else(|| ProxyError::Upstream("All upstreams failed".to_string())))
+}
+
+async fn handle_passthrough_legacy_streaming(
+    config: Arc<Config>,
+    client: Client,
+    openai_req: openai::OpenAIRequest,
+    request_start: Instant,
+    client_headers: &ClientHeaders,
+) -> ProxyResult<Response> {
+    let model = openai_req.model.clone();
+    let urls = config.chat_completions_urls();
+    let mut last_err = None;
+
+    for url in &urls {
+        let prefix = client_headers
+            .log_prefix()
+            .map(|p| format!("[{}] ", p))
+            .unwrap_or_default();
+        tracing::debug!(
+            "{}Sending passthrough legacy streaming request to {} (model: {})",
+            prefix,
+            url,
+            model
+        );
+
+        let mut req_builder = client
+            .post(url)
+            .json(&openai_req)
+            .timeout(Duration::from_secs(300));
+
+        req_builder = client_headers.apply_to_request(req_builder);
+
+        if let Some(api_key) = &config.api_key {
+            req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key));
+        }
+
+        let upstream_start = Instant::now();
+        let response = match req_builder.send().await {
+            Ok(resp) => {
+                metrics::upstream_latency(upstream_start.elapsed().as_secs_f64(), "chat_completions");
+                resp
+            }
+            Err(err) => {
+                tracing::warn!("Failed to reach {}: {:?}", url, err);
+                metrics::upstream_error("chat_completions");
+                last_err = Some(ProxyError::Http(err));
+                continue;
+            }
+        };
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            tracing::warn!("Passthrough legacy upstream {} returned {}: {}", url, status, error_text);
+            metrics::upstream_error("chat_completions");
+
+            if is_retriable_status(status.as_u16()) {
+                last_err = Some(ProxyError::Upstream(format!(
+                    "Upstream returned {}: {}",
+                    status, error_text
+                )));
+                continue;
+            }
+            return Err(ProxyError::Upstream(format!(
+                "Upstream returned {}: {}",
+                status, error_text
+            )));
+        }
+
+        let upstream = response.bytes_stream();
+        let sse_stream = create_passthrough_sse_stream(upstream, model.clone(), request_start);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "Content-Type",
+            HeaderValue::from_static("text/event-stream"),
+        );
+        headers.insert("Cache-Control", HeaderValue::from_static("no-cache"));
+        headers.insert("Connection", HeaderValue::from_static("keep-alive"));
+
+        return Ok((headers, Body::from_stream(sse_stream)).into_response());
+    }
+
+    Err(last_err.unwrap_or_else(|| ProxyError::Upstream("All upstreams failed".to_string())))
+}
+
+/// Passthrough SSE stream — forwards upstream SSE frames directly without translation.
+fn create_passthrough_sse_stream(
+    upstream: impl Stream<Item = Result<Bytes, impl std::fmt::Display + Send + 'static>>
+        + Send
+        + 'static,
+    model: String,
+    request_start: Instant,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    async_stream::stream! {
+        let mut buffer = String::new();
+        let mut first_token_logged = false;
+        let mut usage_logged = false;
+
+        tokio::pin!(upstream);
+
+        while let Some(chunk) = upstream.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    let text = String::from_utf8_lossy(&bytes);
+                    buffer.push_str(&text);
+
+                    while let Some(pos) = buffer.find("\n\n") {
+                        let frame = buffer[..pos + 2].to_string();
+                        buffer = buffer[pos + 2..].to_string();
+
+                        yield Ok(Bytes::from(frame.clone()));
+
+                        for line in frame.lines() {
+                            if let Some(data) = line.strip_prefix("data: ") {
+                                if data.trim() == "[DONE]" {
+                                    if !usage_logged {
+                                        tracing::warn!(
+                                            model = model.as_str(),
+                                            total_ms = request_start.elapsed().as_millis(),
+                                            "Passthrough stream completed without usage info"
+                                        );
+                                    }
+                                    continue;
+                                }
+
+                                if let Ok(chunk) = serde_json::from_str::<openai::StreamChunk>(data) {
+                                    if !first_token_logged {
+                                        let has_content = chunk.choices.iter().any(|c| {
+                                            c.delta.content.as_ref().is_some_and(|s| !s.is_empty())
+                                                || c.delta.reasoning.as_ref().is_some_and(|s| !s.is_empty())
+                                                || c.delta.tool_calls.as_ref().is_some_and(|t| !t.is_empty())
+                                        });
+                                        if has_content {
+                                            tracing::info!(
+                                                model = model.as_str(),
+                                                ttfb_ms = request_start.elapsed().as_millis(),
+                                                "First token received (passthrough)"
+                                            );
+                                            first_token_logged = true;
+                                        }
+                                    }
+
+                                    if let Some(usage) = &chunk.usage {
+                                        let cached = usage
+                                            .prompt_tokens_details
+                                            .as_ref()
+                                            .and_then(|d| d.cached_tokens)
+                                            .unwrap_or(0);
+                                        tracing::info!(
+                                            model = model.as_str(),
+                                            prompt_tokens = usage.prompt_tokens,
+                                            completion_tokens = usage.completion_tokens,
+                                            total_tokens = usage.total_tokens,
+                                            cached_tokens = cached,
+                                            "Passthrough stream usage"
+                                        );
+                                        usage_logged = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Passthrough stream error: {}", e);
+                    break;
+                }
+            }
+        }
+    }
+}
+
 fn serialize_event(event: &anthropic::StreamEvent) -> String {
     format!(
         "event: {}\ndata: {}\n\n",
@@ -884,7 +1389,7 @@ fn extract_billing_value(text: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{create_sse_stream, ClientHeaders};
+    use super::{create_passthrough_sse_stream, create_sse_stream, ClientHeaders};
     use crate::models::anthropic;
     use axum::http::{HeaderMap, HeaderValue};
     use bytes::Bytes;
@@ -1336,5 +1841,102 @@ mod tests {
         let headers = HeaderMap::new();
         let client_headers = ClientHeaders::from_map(&headers);
         assert!(client_headers.log_prefix().is_none());
+    }
+
+    async fn collect_passthrough_frames(chunks: Vec<String>) -> Vec<String> {
+        let s = make_stream(chunks);
+        let sse = create_passthrough_sse_stream(s, "gpt-4o".to_string(), Instant::now());
+        tokio::pin!(sse);
+
+        let mut frames = Vec::new();
+        while let Some(Ok(bytes)) = sse.next().await {
+            let text = String::from_utf8_lossy(&bytes);
+            let trimmed = text.trim().to_string();
+            if !trimmed.is_empty() {
+                frames.push(trimmed);
+            }
+        }
+        frames
+    }
+
+    #[tokio::test]
+    async fn passthrough_forwards_sse_frames_unchanged() {
+        let chunks = vec![
+            openai_chunk("chatcmpl-1", "gpt-4o", Some("Hello"), None),
+            openai_chunk("chatcmpl-1", "gpt-4o", Some(" world"), None),
+            openai_done(),
+        ];
+
+        let frames = collect_passthrough_frames(chunks).await;
+
+        assert_eq!(frames.len(), 3);
+        assert!(frames[0].starts_with("data: "));
+        assert!(frames[0].contains("Hello"));
+        assert!(frames[1].contains(" world"));
+        assert!(frames[2].contains("[DONE]"));
+    }
+
+    #[tokio::test]
+    async fn passthrough_does_not_translate_stream_events() {
+        let chunks = vec![
+            openai_chunk("chatcmpl-1", "gpt-4o", Some("Hello"), None),
+            openai_done(),
+        ];
+
+        let frames = collect_passthrough_frames(chunks).await;
+
+        assert_eq!(frames.len(), 2);
+        let parsed: Value = serde_json::from_str(
+            frames[0].strip_prefix("data: ").unwrap()
+        ).unwrap();
+        assert_eq!(parsed["id"], "chatcmpl-1");
+        assert_eq!(parsed["choices"][0]["delta"]["content"], "Hello");
+    }
+
+    #[tokio::test]
+    async fn passthrough_handles_split_frames() {
+        let full = format!(
+            "{}{}",
+            openai_chunk("chatcmpl-1", "gpt-4o", Some("split"), None),
+            openai_done()
+        );
+        let mid = full.len() / 2;
+        let chunks = vec![full[..mid].to_string(), full[mid..].to_string()];
+
+        let frames = collect_passthrough_frames(chunks).await;
+
+        let text_deltas: Vec<_> = frames
+            .iter()
+            .filter(|f| f.contains("split"))
+            .collect();
+        assert_eq!(text_deltas.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn passthrough_handles_usage_in_stream() {
+        let chunk_with_usage = json!({
+            "id": "chatcmpl-1",
+            "model": "gpt-4o",
+            "choices": [{ "index": 0, "delta": {} }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15,
+                "prompt_tokens_details": { "cached_tokens": 3 }
+            }
+        });
+        let chunks = vec![
+            format!("data: {}\n\n", serde_json::to_string(&chunk_with_usage).unwrap()),
+            openai_done(),
+        ];
+
+        let frames = collect_passthrough_frames(chunks).await;
+        assert_eq!(frames.len(), 2);
+
+        let parsed: Value = serde_json::from_str(
+            frames[0].strip_prefix("data: ").unwrap()
+        ).unwrap();
+        assert_eq!(parsed["usage"]["prompt_tokens"], 10);
+        assert_eq!(parsed["usage"]["prompt_tokens_details"]["cached_tokens"], 3);
     }
 }
