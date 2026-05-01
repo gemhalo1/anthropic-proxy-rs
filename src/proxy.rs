@@ -15,9 +15,62 @@ use reqwest::Client;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+struct ClientHeaders {
+    title: Option<String>,
+    user_agent: Option<String>,
+    http_referer: Option<String>,
+}
+
+impl ClientHeaders {
+    fn from_map(headers: &HeaderMap) -> Self {
+        let title = headers
+            .get("x-title")
+            .or_else(|| headers.get("X-Title"))
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+
+        let user_agent = headers
+            .get(reqwest::header::USER_AGENT)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+
+        let http_referer = headers
+            .get(reqwest::header::REFERER)
+            .or_else(|| headers.get("http-referer"))
+            .or_else(|| headers.get("HTTP-Referer"))
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+
+        Self {
+            title,
+            user_agent,
+            http_referer,
+        }
+    }
+
+    fn log_prefix(&self) -> Option<&str> {
+        self.title.as_deref().or(self.user_agent.as_deref())
+    }
+
+    fn apply_to_request(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let mut builder = builder;
+        if let Some(ref title) = self.title {
+            builder = builder.header("X-Title", title);
+        }
+        if let Some(ref ua) = self.user_agent {
+            builder = builder.header(reqwest::header::USER_AGENT, ua);
+        }
+        if let Some(ref referer) = self.http_referer {
+            builder = builder.header("HTTP-Referer", referer);
+        }
+        builder
+    }
+}
+
 pub async fn proxy_handler(
     Extension(config): Extension<Arc<Config>>,
     Extension(client): Extension<Client>,
+    headers: HeaderMap,
     Json(req): Json<anthropic::AnthropicRequest>,
 ) -> ProxyResult<Response> {
     let is_streaming = req.stream.unwrap_or(false);
@@ -25,10 +78,16 @@ pub async fn proxy_handler(
     let msg_count = req.messages.len();
     let requested_model = req.model.clone();
 
+    let client_headers = ClientHeaders::from_map(&headers);
+    let log_prefix = client_headers.log_prefix();
+
+    let client_identity = extract_client_identity(&req).or_else(|| log_prefix.map(String::from));
+
     tracing::info!(
         model = requested_model.as_str(),
         stream = is_streaming,
         messages = msg_count,
+        client_identity = client_identity.as_deref().unwrap_or("unknown"),
         "Received request"
     );
     metrics::request_started(is_streaming);
@@ -73,14 +132,14 @@ pub async fn proxy_handler(
 
     let result = if route.is_legacy {
         if is_streaming {
-            handle_legacy_streaming(config, client, openai_req, start).await
+            handle_legacy_streaming(config, client, openai_req, start, &client_headers).await
         } else {
-            handle_legacy_non_streaming(config, client, openai_req, start).await
+            handle_legacy_non_streaming(config, client, openai_req, start, &client_headers).await
         }
     } else if is_streaming {
-        handle_routed_streaming(config, client, openai_req, start, route, requested_model).await
+        handle_routed_streaming(config, client, openai_req, start, route, requested_model, &client_headers).await
     } else {
-        handle_routed_non_streaming(config, client, openai_req, start, route, requested_model).await
+        handle_routed_non_streaming(config, client, openai_req, start, route, requested_model, &client_headers).await
     };
 
     let status = match &result {
@@ -259,6 +318,7 @@ async fn handle_routed_non_streaming(
     request_start: Instant,
     route: ResolvedRoute,
     requested_model: String,
+    client_headers: &ClientHeaders,
 ) -> ProxyResult<Response> {
     let model = openai_req.model.clone();
 
@@ -274,8 +334,13 @@ async fn handle_routed_non_streaming(
     let mut last_err = None;
 
     for (url, api_key) in &urls_to_try {
+        let prefix = client_headers
+            .log_prefix()
+            .map(|p| format!("[{}] ", p))
+            .unwrap_or_default();
         tracing::debug!(
-            "Sending non-streaming request to {} (model: {})",
+            "{}Sending non-streaming request to {} (model: {})",
+            prefix,
             url,
             model
         );
@@ -284,6 +349,8 @@ async fn handle_routed_non_streaming(
             .post(url)
             .json(&openai_req)
             .timeout(Duration::from_secs(300));
+
+        req_builder = client_headers.apply_to_request(req_builder);
 
         if let Some(key) = api_key {
             req_builder = req_builder.header("Authorization", format!("Bearer {}", key));
@@ -331,6 +398,12 @@ async fn handle_routed_non_streaming(
         let openai_resp: openai::OpenAIResponse = response.json().await?;
         let prompt_tokens = openai_resp.usage.prompt_tokens;
         let completion_tokens = openai_resp.usage.completion_tokens;
+        let cached_tokens = openai_resp
+            .usage
+            .prompt_tokens_details
+            .as_ref()
+            .and_then(|d| d.cached_tokens)
+            .unwrap_or(0);
 
         tracing::info!(
             model = model.as_str(),
@@ -353,6 +426,7 @@ async fn handle_routed_non_streaming(
             total_ms = request_start.elapsed().as_millis(),
             prompt_tokens = prompt_tokens,
             completion_tokens = completion_tokens,
+            cached_tokens = cached_tokens,
             "Request completed"
         );
 
@@ -369,6 +443,7 @@ async fn handle_routed_streaming(
     request_start: Instant,
     route: ResolvedRoute,
     requested_model: String,
+    client_headers: &ClientHeaders,
 ) -> ProxyResult<Response> {
     let model = openai_req.model.clone();
 
@@ -384,12 +459,23 @@ async fn handle_routed_streaming(
     let mut last_err = None;
 
     for (url, api_key) in &urls_to_try {
-        tracing::debug!("Sending streaming request to {} (model: {})", url, model);
+        let prefix = client_headers
+            .log_prefix()
+            .map(|p| format!("[{}] ", p))
+            .unwrap_or_default();
+        tracing::debug!(
+            "{}Sending streaming request to {} (model: {})",
+            prefix,
+            url,
+            model
+        );
 
         let mut req_builder = client
             .post(url)
             .json(&openai_req)
             .timeout(Duration::from_secs(300));
+
+        req_builder = client_headers.apply_to_request(req_builder);
 
         if let Some(key) = api_key {
             req_builder = req_builder.header("Authorization", format!("Bearer {}", key));
@@ -456,14 +542,20 @@ async fn handle_legacy_non_streaming(
     client: Client,
     openai_req: openai::OpenAIRequest,
     request_start: Instant,
+    client_headers: &ClientHeaders,
 ) -> ProxyResult<Response> {
     let model = openai_req.model.clone();
     let urls = config.chat_completions_urls();
     let mut last_err = None;
 
     for url in &urls {
+        let prefix = client_headers
+            .log_prefix()
+            .map(|p| format!("[{}] ", p))
+            .unwrap_or_default();
         tracing::debug!(
-            "Sending non-streaming request to {} (model: {})",
+            "{}Sending non-streaming request to {} (model: {})",
+            prefix,
             url,
             model
         );
@@ -472,6 +564,8 @@ async fn handle_legacy_non_streaming(
             .post(url)
             .json(&openai_req)
             .timeout(Duration::from_secs(300));
+
+        req_builder = client_headers.apply_to_request(req_builder);
 
         if let Some(api_key) = &config.api_key {
             req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key));
@@ -520,6 +614,12 @@ async fn handle_legacy_non_streaming(
 
         let prompt_tokens = openai_resp.usage.prompt_tokens;
         let completion_tokens = openai_resp.usage.completion_tokens;
+        let cached_tokens = openai_resp
+            .usage
+            .prompt_tokens_details
+            .as_ref()
+            .and_then(|d| d.cached_tokens)
+            .unwrap_or(0);
 
         tracing::info!(
             model = model.as_str(),
@@ -543,6 +643,7 @@ async fn handle_legacy_non_streaming(
             total_ms = request_start.elapsed().as_millis(),
             prompt_tokens = prompt_tokens,
             completion_tokens = completion_tokens,
+            cached_tokens = cached_tokens,
             "Request completed"
         );
 
@@ -564,18 +665,30 @@ async fn handle_legacy_streaming(
     client: Client,
     openai_req: openai::OpenAIRequest,
     request_start: Instant,
+    client_headers: &ClientHeaders,
 ) -> ProxyResult<Response> {
     let model = openai_req.model.clone();
     let urls = config.chat_completions_urls();
     let mut last_err = None;
 
     for url in &urls {
-        tracing::debug!("Sending streaming request to {} (model: {})", url, model);
+        let prefix = client_headers
+            .log_prefix()
+            .map(|p| format!("[{}] ", p))
+            .unwrap_or_default();
+        tracing::debug!(
+            "{}Sending streaming request to {} (model: {})",
+            prefix,
+            url,
+            model
+        );
 
         let mut req_builder = client
             .post(url)
             .json(&openai_req)
             .timeout(Duration::from_secs(300));
+
+        req_builder = client_headers.apply_to_request(req_builder);
 
         if let Some(api_key) = &config.api_key {
             req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key));
@@ -656,6 +769,7 @@ fn create_sse_stream(
         let mut buffer = String::new();
         let mut state = stream::initial_state(model.clone());
         let mut first_token_logged = false;
+        let mut usage_logged = false;
 
         tokio::pin!(upstream);
 
@@ -679,11 +793,13 @@ fn create_sse_stream(
                                     for event in stream::translate_done(&mut state) {
                                         yield Ok(Bytes::from(serialize_event(&event)));
                                     }
-                                    tracing::info!(
-                                        model = model.as_str(),
-                                        total_ms = request_start.elapsed().as_millis(),
-                                        "Stream completed"
-                                    );
+                                    if !usage_logged {
+                                        tracing::warn!(
+                                            model = model.as_str(),
+                                            total_ms = request_start.elapsed().as_millis(),
+                                            "Stream completed without usage info from upstream"
+                                        );
+                                    }
                                     continue;
                                 }
 
@@ -705,6 +821,23 @@ fn create_sse_stream(
 
                                     for event in stream::translate_chunk(&mut state, &chunk) {
                                         yield Ok(Bytes::from(serialize_event(&event)));
+                                    }
+
+                                    if let Some(usage) = &chunk.usage {
+                                        let cached = usage
+                                            .prompt_tokens_details
+                                            .as_ref()
+                                            .and_then(|d| d.cached_tokens)
+                                            .unwrap_or(0);
+                                        tracing::info!(
+                                            model = model.as_str(),
+                                            prompt_tokens = usage.prompt_tokens,
+                                            completion_tokens = usage.completion_tokens,
+                                            total_tokens = usage.total_tokens,
+                                            cached_tokens = cached,
+                                            "Stream usage"
+                                        );
+                                        usage_logged = true;
                                     }
                                 } else {
                                     tracing::debug!("Ignoring unrecognized upstream stream chunk: {}", data);
@@ -730,9 +863,30 @@ fn create_sse_stream(
     }
 }
 
+fn extract_client_identity(req: &anthropic::AnthropicRequest) -> Option<String> {
+    match &req.system {
+        Some(anthropic::SystemPrompt::Single(text)) => {
+            extract_billing_value(text)
+        }
+        Some(anthropic::SystemPrompt::Multiple(messages)) => {
+            messages.iter().find_map(|msg| extract_billing_value(&msg.text))
+        }
+        None => None,
+    }
+}
+
+fn extract_billing_value(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    trimmed
+        .strip_prefix("x-anthropic-billing-header:")
+        .map(|v| v.trim().to_string())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::create_sse_stream;
+    use super::{create_sse_stream, ClientHeaders};
+    use crate::models::anthropic;
+    use axum::http::{HeaderMap, HeaderValue};
     use bytes::Bytes;
     use futures::stream::{self, StreamExt};
     use serde_json::{json, Value};
@@ -1060,5 +1214,127 @@ mod tests {
         assert_eq!(block_starts.len(), 2);
         assert_eq!(block_starts[0]["content_block"]["type"], "text");
         assert_eq!(block_starts[1]["content_block"]["type"], "tool_use");
+    }
+
+    #[test]
+    fn extract_client_identity_from_single_system() {
+        let req = anthropic::AnthropicRequest {
+            model: "test".into(),
+            messages: vec![],
+            max_tokens: 64,
+            system: Some(anthropic::SystemPrompt::Single(
+                "x-anthropic-billing-header: cc_version=2.1; cc_entrypoint=claude-code".into(),
+            )),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: None,
+            tools: None,
+            metadata: None,
+            extra: serde_json::json!({}),
+        };
+
+        let identity = super::extract_client_identity(&req);
+        assert_eq!(
+            identity,
+            Some("cc_version=2.1; cc_entrypoint=claude-code".into())
+        );
+    }
+
+    #[test]
+    fn extract_client_identity_from_multiple_system() {
+        let req = anthropic::AnthropicRequest {
+            model: "test".into(),
+            messages: vec![],
+            max_tokens: 64,
+            system: Some(anthropic::SystemPrompt::Multiple(vec![
+                anthropic::SystemMessage {
+                    message_type: "text".into(),
+                    text: "Be helpful.".into(),
+                    cache_control: None,
+                },
+                anthropic::SystemMessage {
+                    message_type: "text".into(),
+                    text: "x-anthropic-billing-header: cc_version=2.1".into(),
+                    cache_control: None,
+                },
+            ])),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: None,
+            tools: None,
+            metadata: None,
+            extra: serde_json::json!({}),
+        };
+
+        let identity = super::extract_client_identity(&req);
+        assert_eq!(identity, Some("cc_version=2.1".into()));
+    }
+
+    #[test]
+    fn extract_client_identity_returns_none_without_billing() {
+        let req = anthropic::AnthropicRequest {
+            model: "test".into(),
+            messages: vec![],
+            max_tokens: 64,
+            system: Some(anthropic::SystemPrompt::Single("Be helpful.".into())),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: None,
+            tools: None,
+            metadata: None,
+            extra: serde_json::json!({}),
+        };
+
+        let identity = super::extract_client_identity(&req);
+        assert!(identity.is_none());
+    }
+
+    #[test]
+    fn client_headers_extract_title() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-title", HeaderValue::from_static("Cherry Studio"));
+
+        let client_headers = ClientHeaders::from_map(&headers);
+        assert_eq!(client_headers.title.as_deref(), Some("Cherry Studio"));
+        assert_eq!(client_headers.log_prefix(), Some("Cherry Studio"));
+    }
+
+    #[test]
+    fn client_headers_extract_user_agent() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::USER_AGENT,
+            HeaderValue::from_static("my-app/1.0"),
+        );
+
+        let client_headers = ClientHeaders::from_map(&headers);
+        assert_eq!(client_headers.user_agent.as_deref(), Some("my-app/1.0"));
+        assert_eq!(client_headers.log_prefix(), Some("my-app/1.0"));
+    }
+
+    #[test]
+    fn client_headers_title_takes_precedence_over_ua() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-title", HeaderValue::from_static("Cherry Studio"));
+        headers.insert(
+            reqwest::header::USER_AGENT,
+            HeaderValue::from_static("my-app/1.0"),
+        );
+
+        let client_headers = ClientHeaders::from_map(&headers);
+        assert_eq!(client_headers.log_prefix(), Some("Cherry Studio"));
+    }
+
+    #[test]
+    fn client_headers_empty_when_nothing_set() {
+        let headers = HeaderMap::new();
+        let client_headers = ClientHeaders::from_map(&headers);
+        assert!(client_headers.log_prefix().is_none());
     }
 }

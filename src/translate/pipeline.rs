@@ -131,6 +131,15 @@ pub fn translate_request(
         top_p: req.top_p,
         stop: req.stop_sequences,
         stream: req.stream,
+        stream_options: req.stream.and_then(|s| {
+            if s {
+                Some(openai::StreamOptions {
+                    include_usage: Some(true),
+                })
+            } else {
+                None
+            }
+        }),
         tools,
         tool_choice: None,
     })
@@ -192,6 +201,12 @@ pub fn translate_response(
         usage: anthropic::Usage {
             input_tokens: resp.usage.prompt_tokens,
             output_tokens: resp.usage.completion_tokens,
+            cache_read_input_tokens: resp
+                .usage
+                .prompt_tokens_details
+                .as_ref()
+                .and_then(|d| d.cached_tokens),
+            cache_creation_input_tokens: None,
         },
     })
 }
@@ -674,6 +689,8 @@ mod tests {
                 prompt_tokens: 5,
                 completion_tokens: 1,
                 total_tokens: 6,
+                prompt_tokens_details: None,
+                completion_tokens_details: None,
             },
             system_fingerprint: None,
         };
@@ -703,6 +720,8 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 2,
                 total_tokens: 12,
+                prompt_tokens_details: None,
+                completion_tokens_details: None,
             },
             system_fingerprint: None,
         };
@@ -739,6 +758,8 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 5,
                 total_tokens: 15,
+                prompt_tokens_details: None,
+                completion_tokens_details: None,
             },
             system_fingerprint: None,
         };
